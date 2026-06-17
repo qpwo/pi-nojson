@@ -45,16 +45,9 @@ describe("Mistral tool schema serialization", () => {
 			},
 		});
 
-		expect(capturedPayload?.tools).toHaveLength(1);
-		const payloadParameters = capturedPayload?.tools?.[0]?.function.parameters;
-		expect(payloadParameters).toBeDefined();
-		expect(Object.getOwnPropertySymbols(payloadParameters ?? {})).toHaveLength(0);
-		const properties = payloadParameters?.properties;
-		expect(properties).toBeTruthy();
-		expect(Object.getOwnPropertySymbols((properties as Record<string, unknown>) ?? {})).toHaveLength(0);
-		const nested = (properties as Record<string, unknown> | undefined)?.nested;
-		expect(nested).toBeTruthy();
-		expect(Object.getOwnPropertySymbols((nested as Record<string, unknown>) ?? {})).toHaveLength(0);
+		expect(capturedPayload?.tools).toBeUndefined();
+		expect(JSON.stringify(capturedPayload)).toContain("inspect_schema");
+		expect(JSON.stringify(capturedPayload)).toContain("nested");
 		expect(response.stopReason).toBe("error");
 		expect(response.errorMessage).not.toContain("Input validation failed");
 	});

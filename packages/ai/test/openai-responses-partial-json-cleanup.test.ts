@@ -1,8 +1,9 @@
 import type { ResponseStreamEvent } from "openai/resources/responses/responses.js";
 import { describe, expect, it, vi } from "vitest";
 import { processResponsesStream } from "../src/providers/openai-responses-shared.ts";
-import type { AssistantMessage, AssistantMessageEvent, Model } from "../src/types.ts";
+import type { AssistantMessage, Model } from "../src/types.ts";
 import { AssistantMessageEventStream } from "../src/utils/event-stream.ts";
+import { attachTextToolCalls } from "../src/utils/text-tools.ts";
 
 function createOutput(model: Model<"openai-responses">): AssistantMessage {
 	return {
@@ -24,43 +25,51 @@ function createOutput(model: Model<"openai-responses">): AssistantMessage {
 	};
 }
 
-async function* createFunctionCallEvents(argumentsJson: string): AsyncIterable<ResponseStreamEvent> {
+async function* createTextToolEvents(): AsyncIterable<ResponseStreamEvent> {
 	yield {
 		type: "response.output_item.added",
 		item: {
-			type: "function_call",
-			id: "fc_test",
-			call_id: "call_test",
-			name: "edit",
-			arguments: "",
+			type: "message",
+			id: "msg_test",
+			role: "assistant",
+			content: [],
+			status: "in_progress",
 		},
 	} as ResponseStreamEvent;
 	yield {
-		type: "response.function_call_arguments.delta",
-		delta: '{"path":"README.md"',
+		type: "response.content_part.added",
+		item_id: "msg_test",
+		output_index: 0,
+		content_index: 0,
+		part: { type: "output_text", text: "", annotations: [] },
 	} as ResponseStreamEvent;
 	yield {
-		type: "response.function_call_arguments.delta",
-		delta: ',"content":"updated"}',
-	} as ResponseStreamEvent;
-	yield {
-		type: "response.function_call_arguments.done",
-		arguments: argumentsJson,
+		type: "response.output_text.delta",
+		item_id: "msg_test",
+		output_index: 0,
+		content_index: 0,
+		delta: "<replace_text>\npath=README.md\ncontent=updated\n</replace_text>",
 	} as ResponseStreamEvent;
 	yield {
 		type: "response.output_item.done",
 		item: {
-			type: "function_call",
-			id: "fc_test",
-			call_id: "call_test",
-			name: "edit",
-			arguments: argumentsJson,
+			type: "message",
+			id: "msg_test",
+			role: "assistant",
+			content: [
+				{
+					type: "output_text",
+					text: "<replace_text>\npath=README.md\ncontent=updated\n</replace_text>",
+					annotations: [],
+				},
+			],
+			status: "completed",
 		},
 	} as ResponseStreamEvent;
 }
 
-describe("openai responses partialJson cleanup", () => {
-	it("removes partialJson from persisted tool-call blocks at output_item.done", async () => {
+describe("openai responses text tool parsing", () => {
+	it("parses text tool blocks from streamed output without native function_call items", async () => {
 		const model: Model<"openai-responses"> = {
 			id: "gpt-5-mini",
 			name: "GPT-5 Mini",
@@ -76,9 +85,9 @@ describe("openai responses partialJson cleanup", () => {
 		const output = createOutput(model);
 		const stream = new AssistantMessageEventStream();
 		const pushSpy = vi.spyOn(stream, "push");
-		const argumentsJson = '{"path":"README.md","content":"updated"}';
 
-		await processResponsesStream(createFunctionCallEvents(argumentsJson), output, stream, model);
+		await processResponsesStream(createTextToolEvents(), output, stream, model);
+		attachTextToolCalls({ tools: [{ name: "replace_text", description: "Replace text", parameters: {} }] }, output);
 
 		expect(output.content).toHaveLength(1);
 		const persistedToolCall = output.content[0];
@@ -87,15 +96,6 @@ describe("openai responses partialJson cleanup", () => {
 			throw new Error("Expected toolCall block");
 		}
 		expect(persistedToolCall.arguments).toEqual({ path: "README.md", content: "updated" });
-		expect("partialJson" in persistedToolCall).toBe(false);
-
-		const emittedEvents = pushSpy.mock.calls.map(([event]) => event as AssistantMessageEvent);
-		const toolCallEnd = emittedEvents.find((event) => event.type === "toolcall_end");
-		expect(toolCallEnd).toBeDefined();
-		if (!toolCallEnd || toolCallEnd.type !== "toolcall_end") {
-			throw new Error("Expected toolcall_end event");
-		}
-		expect(toolCallEnd.toolCall).toBe(persistedToolCall);
-		expect("partialJson" in toolCallEnd.toolCall).toBe(false);
+		expect(JSON.stringify(pushSpy.mock.calls)).not.toContain("function_call");
 	});
 });

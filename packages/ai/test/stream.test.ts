@@ -735,8 +735,9 @@ describe("Generate E2E Tests", () => {
 		},
 	);
 
-	describe.skipIf(!process.env.HF_TOKEN)("Hugging Face Provider (Kimi-K2.5 via OpenAI Completions)", () => {
+	describe.skipIf(!process.env.HF_TOKEN)("Hugging Face Provider (Kimi via OpenAI Completions)", () => {
 		const llm = getModel("huggingface", "moonshotai/Kimi-K2.5");
+		const thinkingLlm = getModel("huggingface", "moonshotai/Kimi-K2.6");
 
 		it("should complete basic text generation", { retry: 3 }, async () => {
 			await basicTextGeneration(llm);
@@ -751,11 +752,11 @@ describe("Generate E2E Tests", () => {
 		});
 
 		it("should handle thinking mode", { retry: 3 }, async () => {
-			await handleThinking(llm, { reasoningEffort: "medium" });
+			await handleThinking(thinkingLlm, { reasoningEffort: "medium" });
 		});
 
 		it("should handle multi-turn with thinking and tools", { retry: 3 }, async () => {
-			await multiTurn(llm, { reasoningEffort: "medium" });
+			await multiTurn(thinkingLlm, { reasoningEffort: "medium" });
 		});
 	});
 

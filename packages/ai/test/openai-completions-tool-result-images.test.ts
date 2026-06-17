@@ -88,15 +88,16 @@ describe("openai-completions convertMessages", () => {
 
 		const messages = convertMessages(model, context, compat);
 		const roles = messages.map((message) => message.role);
-		expect(roles).toEqual(["user", "assistant", "tool", "tool", "user"]);
+		expect(roles).toEqual(["user", "assistant", "user"]);
 
 		const imageMessage = messages[messages.length - 1];
 		expect(imageMessage.role).toBe("user");
 		expect(Array.isArray(imageMessage.content)).toBe(true);
 
-		const imageParts = (imageMessage.content as Array<{ type?: string }>).filter(
-			(part) => part?.type === "image_url",
-		);
+		const parts = imageMessage.content as Array<{ type?: string; text?: string }>;
+		const textParts = parts.filter((part) => part?.type === "text");
+		expect(textParts.map((part) => part.text).join("\n")).toContain("<tool_results>");
+		const imageParts = parts.filter((part) => part?.type === "image_url");
 		expect(imageParts.length).toBe(2);
 	});
 });

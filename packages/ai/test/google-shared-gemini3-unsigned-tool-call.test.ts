@@ -69,13 +69,14 @@ describe("google-shared convertMessages — Gemini 3 unsigned tool calls", () =>
 		const modelTurn = contents.find((c) => c.role === "model");
 		expect(modelTurn).toBeTruthy();
 
-		const functionCallParts = modelTurn?.parts?.filter((p) => p.functionCall !== undefined) ?? [];
-		expect(functionCallParts).toHaveLength(2);
-		expect(functionCallParts[0]?.thoughtSignature).toBeUndefined();
-		expect(functionCallParts[1]?.thoughtSignature).toBeUndefined();
+		const textParts = modelTurn?.parts?.filter((p) => p.text !== undefined) ?? [];
+		expect(textParts).toHaveLength(2);
+		expect(textParts[0]?.text).toContain("<bash");
+		expect(textParts[1]?.text).toContain("<bash");
+		expect(textParts[0]?.thoughtSignature).toBeUndefined();
+		expect(textParts[1]?.thoughtSignature).toBeUndefined();
 		expect(JSON.stringify(modelTurn)).not.toContain("skip_thought_signature_validator");
 
-		const textParts = modelTurn?.parts?.filter((p) => p.text !== undefined) ?? [];
 		const historicalText = textParts.filter((p) => p.text?.includes("Historical context"));
 		expect(historicalText).toHaveLength(0);
 	});
@@ -84,11 +85,13 @@ describe("google-shared convertMessages — Gemini 3 unsigned tool calls", () =>
 		const model = makeGemini3Model("google-vertex", "google-vertex");
 		const contents = convertMessages(model, makeContext(model));
 		const modelTurn = contents.find((c) => c.role === "model");
-		const functionCallParts = modelTurn?.parts?.filter((p) => p.functionCall !== undefined) ?? [];
+		const textParts = modelTurn?.parts?.filter((p) => p.text !== undefined) ?? [];
 
-		expect(functionCallParts).toHaveLength(2);
-		expect(functionCallParts[0]?.thoughtSignature).toBeUndefined();
-		expect(functionCallParts[1]?.thoughtSignature).toBeUndefined();
+		expect(textParts).toHaveLength(2);
+		expect(textParts[0]?.text).toContain("<bash");
+		expect(textParts[1]?.text).toContain("<bash");
+		expect(textParts[0]?.thoughtSignature).toBeUndefined();
+		expect(textParts[1]?.thoughtSignature).toBeUndefined();
 		expect(JSON.stringify(modelTurn)).not.toContain("skip_thought_signature_validator");
 	});
 
@@ -97,20 +100,23 @@ describe("google-shared convertMessages — Gemini 3 unsigned tool calls", () =>
 		const validSig = "AAAAAAAAAAAAAAAAAAAAAA==";
 		const contents = convertMessages(model, makeContext(model, validSig));
 		const modelTurn = contents.find((c) => c.role === "model");
-		const functionCallParts = modelTurn?.parts?.filter((p) => p.functionCall !== undefined) ?? [];
+		const textParts = modelTurn?.parts?.filter((p) => p.text !== undefined) ?? [];
 
-		expect(functionCallParts).toHaveLength(2);
-		expect(functionCallParts[0]?.thoughtSignature).toBe(validSig);
-		expect(functionCallParts[1]?.thoughtSignature).toBeUndefined();
+		expect(textParts).toHaveLength(2);
+		expect(textParts[0]?.text).toContain("<bash");
+		expect(textParts[1]?.text).toContain("<bash");
+		expect(textParts[0]?.thoughtSignature).toBe(validSig);
+		expect(textParts[1]?.thoughtSignature).toBeUndefined();
 	});
 
 	it("does not add a thoughtSignature for non-Gemini-3 models", () => {
 		const model = makeGemini3Model("google-generative-ai", "google", "gemini-2.5-flash");
 		const contents = convertMessages(model, makeContext({ ...model, id: "other-model" }));
 		const modelTurn = contents.find((c) => c.role === "model");
-		const fcPart = modelTurn?.parts?.find((p) => p.functionCall !== undefined);
+		const textPart = modelTurn?.parts?.find((p) => p.text !== undefined);
 
-		expect(fcPart).toBeTruthy();
-		expect(fcPart?.thoughtSignature).toBeUndefined();
+		expect(textPart).toBeTruthy();
+		expect(textPart?.text).toContain("<bash");
+		expect(textPart?.thoughtSignature).toBeUndefined();
 	});
 });

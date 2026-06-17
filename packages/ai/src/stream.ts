@@ -5,13 +5,13 @@ import { getEnvApiKey } from "./env-api-keys.ts";
 import type {
 	Api,
 	AssistantMessage,
-	AssistantMessageEventStream,
 	Context,
 	Model,
 	ProviderStreamOptions,
 	SimpleStreamOptions,
 	StreamOptions,
 } from "./types.ts";
+import type { AssistantMessageEventStream } from "./utils/event-stream.ts";
 
 export { getEnvApiKey } from "./env-api-keys.ts";
 
@@ -37,13 +37,22 @@ function resolveApiProvider(api: Api) {
 	return provider;
 }
 
+import { contextWithTextToolProtocol, wrapTextToolStream } from "./utils/text-tools.ts";
+
+function stripTools(context: Context): Context {
+	return contextWithTextToolProtocol(context);
+}
+
 export function stream<TApi extends Api>(
 	model: Model<TApi>,
 	context: Context,
 	options?: ProviderStreamOptions,
 ): AssistantMessageEventStream {
 	const provider = resolveApiProvider(model.api);
-	return provider.stream(model, context, withEnvApiKey(model, options) as StreamOptions);
+	return wrapTextToolStream(
+		provider.stream(model, stripTools(context), withEnvApiKey(model, options) as StreamOptions),
+		context,
+	);
 }
 
 export async function complete<TApi extends Api>(
@@ -61,7 +70,7 @@ export function streamSimple<TApi extends Api>(
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
 	const provider = resolveApiProvider(model.api);
-	return provider.streamSimple(model, context, withEnvApiKey(model, options));
+	return wrapTextToolStream(provider.streamSimple(model, stripTools(context), withEnvApiKey(model, options)), context);
 }
 
 export async function completeSimple<TApi extends Api>(

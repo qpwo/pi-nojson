@@ -76,27 +76,29 @@ function makeContext(model: { api: string; provider: string; id: string }): Cont
 }
 
 describe("google-shared image tool result routing", () => {
-	it("keeps separate synthetic image turn for Gemini 2.x Google API models", () => {
+	it("serializes tool results as text-plus-image user content for Gemini 2.x Google API models", () => {
 		const model = makeModel("google-generative-ai", "google", "gemini-2.5-flash");
 		const contents = convertMessages(model, makeContext(model));
 
-		expect(contents).toHaveLength(5);
-		expect(contents[2].parts?.every((part) => part.functionResponse)).toBe(true);
-		expect(contents[3].parts?.[0]?.text).toBe("Tool result image:");
-		expect(contents[3].parts?.[1]?.inlineData).toBeTruthy();
-		expect(contents[4].parts?.[0]?.functionResponse).toBeTruthy();
+		expect(contents).toHaveLength(3);
+		expect(contents[2].role).toBe("user");
+		expect(
+			contents[2].parts?.filter((part) => typeof part.text === "string" && part.text.includes("<tool_results>")),
+		).toHaveLength(3);
+		expect(contents[2].parts?.filter((part) => part.inlineData)).toHaveLength(1);
+		expect(JSON.stringify(contents[2])).not.toContain("functionResponse");
 	});
 
-	it("nests image tool results for Gemini 3 Google API models", () => {
+	it("serializes tool results as text-plus-image user content for Gemini 3 Google API models", () => {
 		const model = makeModel("google-generative-ai", "google", "gemini-3-pro-preview");
 		const contents = convertMessages(model, makeContext(model));
 
 		expect(contents).toHaveLength(3);
-		const toolResultTurn = contents[2];
-		expect(toolResultTurn.parts).toHaveLength(3);
-		const imageResponse = toolResultTurn.parts?.[1]?.functionResponse;
-		expect(imageResponse).toBeTruthy();
-		expect(imageResponse?.parts).toHaveLength(1);
-		expect(imageResponse?.parts?.[0]?.inlineData).toBeTruthy();
+		expect(contents[2].role).toBe("user");
+		expect(
+			contents[2].parts?.filter((part) => typeof part.text === "string" && part.text.includes("<tool_results>")),
+		).toHaveLength(3);
+		expect(contents[2].parts?.filter((part) => part.inlineData)).toHaveLength(1);
+		expect(JSON.stringify(contents[2])).not.toContain("functionResponse");
 	});
 });

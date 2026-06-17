@@ -3,7 +3,6 @@ import {
 	type BedrockRuntimeClientConfig,
 	BedrockRuntimeServiceException,
 	StopReason as BedrockStopReason,
-	type Tool as BedrockTool,
 	CachePointType,
 	CacheTTL,
 	type ContentBlock,
@@ -16,13 +15,10 @@ import {
 	ImageFormat,
 	type Message,
 	type SystemContentBlock,
-	type ToolChoice,
-	type ToolConfiguration,
 	type ToolResultContentBlock,
-	ToolResultStatus,
 } from "@aws-sdk/client-bedrock-runtime";
 import { NodeHttpHandler } from "@smithy/node-http-handler";
-import type { BuildMiddleware, DocumentType, MetadataBearer } from "@smithy/types";
+import type { BuildMiddleware, MetadataBearer } from "@smithy/types";
 import { calculateCost } from "../models.ts";
 import type {
 	Api,
@@ -39,14 +35,12 @@ import type {
 	ThinkingBudgets,
 	ThinkingContent,
 	ThinkingLevel,
-	Tool,
-	ToolCall,
 	ToolResultMessage,
 } from "../types.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
-import { parseStreamingJson } from "../utils/json-parse.ts";
 import { createHttpProxyAgentsForTarget } from "../utils/node-http-proxy.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
+import { contextWithTextToolProtocol, formatToolResultText, wrapTextToolStream } from "../utils/text-tools.ts";
 import { adjustMaxTokensForThinking, buildBaseOptions, clampReasoning } from "./simple-options.ts";
 import { transformMessages } from "./transform-messages.ts";
 
@@ -86,7 +80,7 @@ export interface BedrockOptions extends StreamOptions {
 	bearerToken?: string;
 }
 
-type Block = (TextContent | ThinkingContent | ToolCall) & { index?: number; partialJson?: string };
+type Block = (TextContent | ThinkingContent) & { index?: number };
 
 const EMPTY_TEXT_PLACEHOLDER = "<empty>";
 
@@ -95,6 +89,9 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream", BedrockOpt
 	context: Context,
 	options: BedrockOptions = {},
 ): AssistantMessageEventStream => {
+	const originalContext = context;
+	context = contextWithTextToolProtocol(context);
+
 	const stream = new AssistantMessageEventStream();
 
 	(async () => {
@@ -202,7 +199,7 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream", BedrockOpt
 					...(inferenceMaxTokens !== undefined && { maxTokens: inferenceMaxTokens }),
 					...(options.temperature !== undefined && { temperature: options.temperature }),
 				},
-				toolConfig: convertToolConfig(context.tools, options.toolChoice),
+				// tools disabled natively
 				additionalModelRequestFields: buildAdditionalModelRequestFields(model, options),
 				...(options.requestMetadata !== undefined && { requestMetadata: options.requestMetadata }),
 			};
@@ -263,8 +260,6 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream", BedrockOpt
 		} catch (error) {
 			for (const block of output.content) {
 				delete (block as Block).index;
-				// partialJson is only a streaming scratch buffer; never persist it.
-				delete (block as Block).partialJson;
 			}
 			output.stopReason = options.signal?.aborted ? "aborted" : "error";
 			output.errorMessage = formatBedrockError(error);
@@ -273,7 +268,7 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream", BedrockOpt
 		}
 	})();
 
-	return stream;
+	return wrapTextToolStream(stream, originalContext);
 };
 
 /**
@@ -404,21 +399,10 @@ function handleContentBlockStart(
 	output: AssistantMessage,
 	stream: AssistantMessageEventStream,
 ): void {
-	const index = event.contentBlockIndex!;
-	const start = event.start;
-
-	if (start?.toolUse) {
-		const block: Block = {
-			type: "toolCall",
-			id: start.toolUse.toolUseId || "",
-			name: start.toolUse.name || "",
-			arguments: {},
-			partialJson: "",
-			index,
-		};
-		output.content.push(block);
-		stream.push({ type: "toolcall_start", contentIndex: blocks.length - 1, partial: output });
-	}
+	void event;
+	void blocks;
+	void output;
+	void stream;
 }
 
 function handleContentBlockDelta(
@@ -433,7 +417,6 @@ function handleContentBlockDelta(
 	let block = blocks[index];
 
 	if (delta?.text !== undefined) {
-		// If no text block exists yet, create one, as `handleContentBlockStart` is not sent for text blocks
 		if (!block) {
 			const newBlock: Block = { type: "text", text: "", index: contentBlockIndex };
 			output.content.push(newBlock);
@@ -445,10 +428,6 @@ function handleContentBlockDelta(
 			block.text += delta.text;
 			stream.push({ type: "text_delta", contentIndex: index, delta: delta.text, partial: output });
 		}
-	} else if (delta?.toolUse && block?.type === "toolCall") {
-		block.partialJson = (block.partialJson || "") + (delta.toolUse.input || "");
-		block.arguments = parseStreamingJson(block.partialJson);
-		stream.push({ type: "toolcall_delta", contentIndex: index, delta: delta.toolUse.input || "", partial: output });
 	} else if (delta?.reasoningContent) {
 		let thinkingBlock = block;
 		let thinkingIndex = index;
@@ -511,13 +490,6 @@ function handleContentBlockStop(
 			break;
 		case "thinking":
 			stream.push({ type: "thinking_end", contentIndex: index, content: block.thinking, partial: output });
-			break;
-		case "toolCall":
-			block.arguments = parseStreamingJson(block.partialJson);
-			// Finalize in-place and strip the scratch buffer so replay only
-			// carries parsed arguments.
-			delete (block as Block).partialJson;
-			stream.push({ type: "toolcall_end", contentIndex: index, toolCall: block, partial: output });
 			break;
 	}
 }
@@ -681,7 +653,7 @@ function createRequiredTextBlock(text: string): ContentBlock.TextMember {
 	return createNonBlankTextBlock(text) ?? { text: EMPTY_TEXT_PLACEHOLDER };
 }
 
-function convertToolResultContent(content: (TextContent | ImageContent)[]): ToolResultContentBlock[] {
+function _convertToolResultContent(content: (TextContent | ImageContent)[]): ToolResultContentBlock[] {
 	const result: ToolResultContentBlock[] = [];
 	for (const c of content) {
 		if (c.type === "image") {
@@ -750,11 +722,6 @@ function convertMessages(
 							contentBlocks.push(textBlock);
 							break;
 						}
-						case "toolCall":
-							contentBlocks.push({
-								toolUse: { toolUseId: c.id, name: c.name, input: c.arguments },
-							});
-							break;
 						case "thinking": {
 							// Skip empty thinking blocks
 							const thinking = sanitizeSurrogates(c.thinking);
@@ -802,39 +769,26 @@ function convertMessages(
 				break;
 			}
 			case "toolResult": {
-				// Collect all consecutive toolResult messages into a single user message
-				// Bedrock requires all tool results to be in one message
-				const toolResults: ContentBlock.ToolResultMember[] = [];
+				const contentBlocks: ContentBlock[] = [];
+				let j = i;
 
-				// Add current tool result with all content blocks combined
-				toolResults.push({
-					toolResult: {
-						toolUseId: m.toolCallId,
-						content: convertToolResultContent(m.content),
-						status: m.isError ? ToolResultStatus.ERROR : ToolResultStatus.SUCCESS,
-					},
-				});
-
-				// Look ahead for consecutive toolResult messages
-				let j = i + 1;
 				while (j < transformedMessages.length && transformedMessages[j].role === "toolResult") {
-					const nextMsg = transformedMessages[j] as ToolResultMessage;
-					toolResults.push({
-						toolResult: {
-							toolUseId: nextMsg.toolCallId,
-							content: convertToolResultContent(nextMsg.content),
-							status: nextMsg.isError ? ToolResultStatus.ERROR : ToolResultStatus.SUCCESS,
-						},
-					});
+					const toolMsg = transformedMessages[j] as ToolResultMessage;
+					contentBlocks.push(createRequiredTextBlock(formatToolResultText(toolMsg)));
+					for (const part of toolMsg.content) {
+						if (part.type !== "image") continue;
+						contentBlocks.push({
+							image: createImageBlock(part.mimeType, part.data),
+						});
+					}
 					j++;
 				}
 
-				// Skip the messages we've already processed
 				i = j - 1;
 
 				result.push({
 					role: ConversationRole.USER,
-					content: toolResults,
+					content: contentBlocks,
 				});
 				break;
 			}
@@ -857,37 +811,6 @@ function convertMessages(
 	}
 
 	return result;
-}
-
-function convertToolConfig(
-	tools: Tool[] | undefined,
-	toolChoice: BedrockOptions["toolChoice"],
-): ToolConfiguration | undefined {
-	if (!tools?.length || toolChoice === "none") return undefined;
-
-	const bedrockTools: BedrockTool[] = tools.map((tool) => ({
-		toolSpec: {
-			name: tool.name,
-			description: tool.description,
-			inputSchema: { json: tool.parameters as unknown as DocumentType },
-		},
-	}));
-
-	let bedrockToolChoice: ToolChoice | undefined;
-	switch (toolChoice) {
-		case "auto":
-			bedrockToolChoice = { auto: {} };
-			break;
-		case "any":
-			bedrockToolChoice = { any: {} };
-			break;
-		default:
-			if (toolChoice?.type === "tool") {
-				bedrockToolChoice = { tool: { name: toolChoice.name } };
-			}
-	}
-
-	return { tools: bedrockTools, toolChoice: bedrockToolChoice };
 }
 
 function mapStopReason(reason: string | undefined): StopReason {

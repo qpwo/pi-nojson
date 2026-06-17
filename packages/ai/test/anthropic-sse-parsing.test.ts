@@ -79,14 +79,14 @@ function createFakeAnthropicClient(response: Response): Anthropic {
 }
 
 describe("Anthropic raw SSE parsing", () => {
-	it("repairs malformed SSE JSON and malformed streamed tool JSON", async () => {
+	it("repairs malformed SSE JSON while parsing streamed text tool blocks", async () => {
 		const model = getModel("anthropic", "claude-haiku-4-5");
 		const context: Context = {
-			messages: [{ role: "user", content: "Use the edit tool.", timestamp: Date.now() }],
+			messages: [{ role: "user", content: "Use the replace_text tool.", timestamp: Date.now() }],
 			tools: [
 				{
-					name: "edit",
-					description: "Edit a file.",
+					name: "replace_text",
+					description: "Replace text.",
 					parameters: Type.Object({
 						path: Type.String(),
 						text: Type.String(),
@@ -94,8 +94,6 @@ describe("Anthropic raw SSE parsing", () => {
 				},
 			],
 		};
-
-		const malformedToolJsonDelta = String.raw`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"A\H\",\"text\":\"col1	col2\"}"}}`;
 
 		const response = createSseResponse([
 			{
@@ -118,15 +116,17 @@ describe("Anthropic raw SSE parsing", () => {
 				data: JSON.stringify({
 					type: "content_block_start",
 					index: 0,
-					content_block: {
-						type: "tool_use",
-						id: "toolu_test",
-						name: "edit",
-						input: {},
-					},
+					content_block: { type: "text", text: "" },
 				}),
 			},
-			{ event: "content_block_delta", data: malformedToolJsonDelta },
+			{
+				event: "content_block_delta",
+				data: JSON.stringify({
+					type: "content_block_delta",
+					index: 0,
+					delta: { type: "text_delta", text: "<replace_text>\npath=A\\H\ntext=col1\\tcol2\n</replace_text>" },
+				}),
+			},
 			{
 				event: "content_block_stop",
 				data: JSON.stringify({ type: "content_block_stop", index: 0 }),
@@ -135,7 +135,7 @@ describe("Anthropic raw SSE parsing", () => {
 				event: "message_delta",
 				data: JSON.stringify({
 					type: "message_delta",
-					delta: { stop_reason: "tool_use" },
+					delta: { stop_reason: "end_turn" },
 					usage: {
 						input_tokens: 12,
 						output_tokens: 5,
@@ -162,7 +162,7 @@ describe("Anthropic raw SSE parsing", () => {
 		expect(toolCall).toBeDefined();
 		expect(toolCall?.arguments).toEqual({
 			path: "A\\H",
-			text: "col1\tcol2",
+			text: "col1\\tcol2",
 		});
 	});
 

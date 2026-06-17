@@ -90,30 +90,28 @@ async function captureAnthropicRequest(
 	return capturedRequest;
 }
 
-function getFirstTool(body: Record<string, unknown>): Record<string, unknown> {
-	const tools = body.tools;
-	if (!Array.isArray(tools) || typeof tools[0] !== "object" || tools[0] === null) {
-		throw new Error("Expected first tool in request body");
-	}
-	return tools[0] as Record<string, unknown>;
+function expectNoNativeTools(body: Record<string, unknown>): void {
+	expect(body.tools).toBeUndefined();
+	expect(JSON.stringify(body.system)).toContain("Enabled tool names: lookup");
+	expect(JSON.stringify(body.system)).toContain("value");
 }
 
-describe("Anthropic eager tool input streaming compatibility", () => {
-	it("sends per-tool eager_input_streaming by default", async () => {
+describe("Anthropic text-tool compatibility", () => {
+	it("serializes tool schemas into the system prompt without native tools", async () => {
 		const request = await captureAnthropicRequest(undefined, createContext());
 
-		expect(getFirstTool(request.body).eager_input_streaming).toBe(true);
+		expectNoNativeTools(request.body);
 		expect(request.headers["anthropic-beta"]).toBeUndefined();
 	});
 
-	it("uses the legacy fine-grained tool streaming beta when eager tool input streaming is disabled", async () => {
+	it("does not request native fine-grained tool streaming when eager tool input streaming is disabled", async () => {
 		const request = await captureAnthropicRequest({ supportsEagerToolInputStreaming: false }, createContext());
 
-		expect(getFirstTool(request.body).eager_input_streaming).toBeUndefined();
-		expect(request.headers["anthropic-beta"]).toBe("fine-grained-tool-streaming-2025-05-14");
+		expectNoNativeTools(request.body);
+		expect(request.headers["anthropic-beta"]).toBeUndefined();
 	});
 
-	it("does not send the legacy fine-grained tool streaming beta when there are no tools", async () => {
+	it("does not send native tools or tool betas when there are no tools", async () => {
 		const request = await captureAnthropicRequest({ supportsEagerToolInputStreaming: false }, createContext([]));
 
 		expect(request.body.tools).toBeUndefined();

@@ -15,10 +15,11 @@ import type {
 } from "../types.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
+import { contextWithTextToolProtocol, wrapTextToolStream } from "../utils/text-tools.ts";
 import { isCloudflareProvider, resolveCloudflareBaseUrl } from "./cloudflare.ts";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.ts";
 import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
-import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.ts";
+import { convertResponsesMessages, processResponsesStream } from "./openai-responses-shared.ts";
 import { buildBaseOptions } from "./simple-options.ts";
 
 const OPENAI_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
@@ -83,6 +84,9 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses", OpenAIRes
 	context: Context,
 	options?: OpenAIResponsesOptions,
 ): AssistantMessageEventStream => {
+	const originalContext = context;
+	context = contextWithTextToolProtocol(context);
+
 	const stream = new AssistantMessageEventStream();
 
 	// Start async processing
@@ -156,7 +160,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses", OpenAIRes
 		}
 	})();
 
-	return stream;
+	return wrapTextToolStream(stream, originalContext);
 };
 
 export const streamSimpleOpenAIResponses: StreamFunction<"openai-responses", SimpleStreamOptions> = (
@@ -252,9 +256,7 @@ function buildParams(model: Model<"openai-responses">, context: Context, options
 		params.service_tier = options.serviceTier;
 	}
 
-	if (context.tools && context.tools.length > 0) {
-		params.tools = convertResponsesTools(context.tools);
-	}
+	// tools disabled natively
 
 	if (model.reasoning) {
 		if (options?.reasoningEffort || options?.reasoningSummary) {

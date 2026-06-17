@@ -200,7 +200,7 @@ describe("openai-completions empty tools handling", () => {
 		expect(clientOptions.defaultHeaders?.["x-session-affinity"]).toBe("session-1");
 	});
 
-	it("still emits tools: [] for Anthropic/LiteLLM proxy when conversation has tool history", async () => {
+	it("omits native tools when conversation has textified tool history", async () => {
 		const { compat: _compat, ...baseModel } = getModel("openai", "gpt-4o-mini")!;
 		const model = { ...baseModel, api: "openai-completions" } as const;
 
@@ -247,8 +247,9 @@ describe("openai-completions empty tools handling", () => {
 			{ apiKey: "test" },
 		).result();
 
-		const params = mockState.lastParams as { tools?: unknown[] };
-		expect(Array.isArray(params.tools)).toBe(true);
-		expect(params.tools).toEqual([]);
+		const params = mockState.lastParams as { tools?: unknown[]; messages?: unknown[] };
+		expect("tools" in (params as object)).toBe(false);
+		expect(JSON.stringify(params.messages)).toContain("<noop");
+		expect(JSON.stringify(params.messages)).toContain("<tool_results>");
 	});
 });

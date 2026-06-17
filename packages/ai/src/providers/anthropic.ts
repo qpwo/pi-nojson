@@ -24,13 +24,13 @@ import type {
 	TextContent,
 	ThinkingContent,
 	Tool,
-	ToolCall,
 	ToolResultMessage,
 } from "../types.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
-import { parseJsonWithRepair, parseStreamingJson } from "../utils/json-parse.ts";
+import { parseJsonWithRepair } from "../utils/json-parse.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
+import { contextWithTextToolProtocol, formatToolResultText, wrapTextToolStream } from "../utils/text-tools.ts";
 
 import { resolveCloudflareBaseUrl } from "./cloudflare.ts";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.ts";
@@ -95,8 +95,8 @@ const claudeCodeTools = [
 const ccToolLookup = new Map(claudeCodeTools.map((t) => [t.toLowerCase(), t]));
 
 // Convert tool name to CC canonical casing if it matches (case-insensitive)
-const toClaudeCodeName = (name: string) => ccToolLookup.get(name.toLowerCase()) ?? name;
-const fromClaudeCodeName = (name: string, tools?: Tool[]) => {
+const _toClaudeCodeName = (name: string) => ccToolLookup.get(name.toLowerCase()) ?? name;
+const _fromClaudeCodeName = (name: string, tools?: Tool[]) => {
 	if (tools && tools.length > 0) {
 		const lowerName = name.toLowerCase();
 		const matchedTool = tools.find((tool) => tool.name.toLowerCase() === lowerName);
@@ -108,7 +108,7 @@ const fromClaudeCodeName = (name: string, tools?: Tool[]) => {
 /**
  * Convert content blocks to Anthropic API format
  */
-function convertContentBlocks(content: (TextContent | ImageContent)[]):
+function _convertContentBlocks(content: (TextContent | ImageContent)[]):
 	| string
 	| Array<
 			| { type: "text"; text: string }
@@ -451,6 +451,9 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 	context: Context,
 	options?: AnthropicOptions,
 ): AssistantMessageEventStream => {
+	const originalContext = context;
+	context = contextWithTextToolProtocol(context);
+
 	const stream = new AssistantMessageEventStream();
 
 	(async () => {
@@ -523,7 +526,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 			stream.push({ type: "start", partial: output });
 
-			type Block = (ThinkingContent | TextContent | (ToolCall & { partialJson: string })) & { index: number };
+			type Block = (ThinkingContent | TextContent) & { index: number };
 			const blocks = output.content as Block[];
 
 			for await (const event of iterateAnthropicEvents(response, options?.signal)) {
@@ -568,19 +571,6 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 						};
 						output.content.push(block);
 						stream.push({ type: "thinking_start", contentIndex: output.content.length - 1, partial: output });
-					} else if (event.content_block.type === "tool_use") {
-						const block: Block = {
-							type: "toolCall",
-							id: event.content_block.id,
-							name: isOAuth
-								? fromClaudeCodeName(event.content_block.name, context.tools)
-								: event.content_block.name,
-							arguments: (event.content_block.input as Record<string, any>) ?? {},
-							partialJson: "",
-							index: event.index,
-						};
-						output.content.push(block);
-						stream.push({ type: "toolcall_start", contentIndex: output.content.length - 1, partial: output });
 					}
 				} else if (event.type === "content_block_delta") {
 					if (event.delta.type === "text_delta") {
@@ -607,19 +597,6 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 								partial: output,
 							});
 						}
-					} else if (event.delta.type === "input_json_delta") {
-						const index = blocks.findIndex((b) => b.index === event.index);
-						const block = blocks[index];
-						if (block && block.type === "toolCall") {
-							block.partialJson += event.delta.partial_json;
-							block.arguments = parseStreamingJson(block.partialJson);
-							stream.push({
-								type: "toolcall_delta",
-								contentIndex: index,
-								delta: event.delta.partial_json,
-								partial: output,
-							});
-						}
 					} else if (event.delta.type === "signature_delta") {
 						const index = blocks.findIndex((b) => b.index === event.index);
 						const block = blocks[index];
@@ -632,7 +609,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 					const index = blocks.findIndex((b) => b.index === event.index);
 					const block = blocks[index];
 					if (block) {
-						delete (block as any).index;
+						delete (block as { index?: number }).index;
 						if (block.type === "text") {
 							stream.push({
 								type: "text_end",
@@ -645,17 +622,6 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 								type: "thinking_end",
 								contentIndex: index,
 								content: block.thinking,
-								partial: output,
-							});
-						} else if (block.type === "toolCall") {
-							block.arguments = parseStreamingJson(block.partialJson);
-							// Finalize in-place and strip the scratch buffer so replay only
-							// carries parsed arguments.
-							delete (block as { partialJson?: string }).partialJson;
-							stream.push({
-								type: "toolcall_end",
-								contentIndex: index,
-								toolCall: block,
 								partial: output,
 							});
 						}
@@ -712,7 +678,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 		}
 	})();
 
-	return stream;
+	return wrapTextToolStream(stream, originalContext);
 };
 
 /**
@@ -943,14 +909,7 @@ function buildParams(
 		params.temperature = options.temperature;
 	}
 
-	if (context.tools && context.tools.length > 0) {
-		params.tools = convertTools(
-			context.tools,
-			isOAuthToken,
-			compat.supportsEagerToolInputStreaming,
-			compat.supportsCacheControlOnTools ? cacheControl : undefined,
-		);
-	}
+	// tools disabled natively
 
 	// Configure thinking mode: adaptive, budget-based, or explicitly disabled.
 	if (model.reasoning) {
@@ -990,13 +949,7 @@ function buildParams(
 		}
 	}
 
-	if (options?.toolChoice) {
-		if (typeof options.toolChoice === "string") {
-			params.tool_choice = { type: options.toolChoice };
-		} else {
-			params.tool_choice = options.toolChoice;
-		}
-	}
+	// tools disabled natively
 
 	return params;
 }
@@ -1009,7 +962,7 @@ function normalizeToolCallId(id: string): string {
 function convertMessages(
 	messages: Message[],
 	model: Model<"anthropic-messages">,
-	isOAuthToken: boolean,
+	_isOAuthToken: boolean,
 	cacheControl?: CacheControlEphemeral,
 	allowEmptySignature = false,
 ): MessageParam[] {
@@ -1102,13 +1055,6 @@ function convertMessages(
 							signature: block.thinkingSignature,
 						});
 					}
-				} else if (block.type === "toolCall") {
-					blocks.push({
-						type: "tool_use",
-						id: block.id,
-						name: isOAuthToken ? toClaudeCodeName(block.name) : block.name,
-						input: block.arguments ?? {},
-					});
 				}
 			}
 			if (blocks.length === 0) continue;
@@ -1117,37 +1063,35 @@ function convertMessages(
 				content: blocks,
 			});
 		} else if (msg.role === "toolResult") {
-			// Collect all consecutive toolResult messages, needed for z.ai Anthropic endpoint
-			const toolResults: ContentBlockParam[] = [];
+			const toolResultBlocks: ContentBlockParam[] = [];
+			let j = i;
 
-			// Add the current tool result
-			toolResults.push({
-				type: "tool_result",
-				tool_use_id: msg.toolCallId,
-				content: convertContentBlocks(msg.content),
-				is_error: msg.isError,
-			});
-
-			// Look ahead for consecutive toolResult messages
-			let j = i + 1;
 			while (j < transformedMessages.length && transformedMessages[j].role === "toolResult") {
-				const nextMsg = transformedMessages[j] as ToolResultMessage; // We know it's a toolResult
-				toolResults.push({
-					type: "tool_result",
-					tool_use_id: nextMsg.toolCallId,
-					content: convertContentBlocks(nextMsg.content),
-					is_error: nextMsg.isError,
+				const toolMsg = transformedMessages[j] as ToolResultMessage;
+				toolResultBlocks.push({
+					type: "text",
+					text: sanitizeSurrogates(formatToolResultText(toolMsg)),
 				});
+				for (const part of toolMsg.content) {
+					if (part.type !== "image") continue;
+					toolResultBlocks.push({
+						type: "image",
+						source: {
+							type: "base64",
+							media_type: part.mimeType as "image/jpeg" | "image/png" | "image/gif" | "image/webp",
+							data: part.data,
+						},
+					});
+				}
 				j++;
 			}
 
-			// Skip the messages we've already processed
 			i = j - 1;
 
-			// Add a single user message with all tool results
+			if (toolResultBlocks.length === 0) continue;
 			params.push({
 				role: "user",
-				content: toolResults,
+				content: toolResultBlocks,
 			});
 		}
 	}
@@ -1158,10 +1102,7 @@ function convertMessages(
 		if (lastMessage.role === "user") {
 			if (Array.isArray(lastMessage.content)) {
 				const lastBlock = lastMessage.content[lastMessage.content.length - 1];
-				if (
-					lastBlock &&
-					(lastBlock.type === "text" || lastBlock.type === "image" || lastBlock.type === "tool_result")
-				) {
+				if (lastBlock && (lastBlock.type === "text" || lastBlock.type === "image")) {
 					(lastBlock as any).cache_control = cacheControl;
 				}
 			} else if (typeof lastMessage.content === "string") {
@@ -1179,33 +1120,8 @@ function convertMessages(
 	return params;
 }
 
-function shouldUseFineGrainedToolStreamingBeta(model: Model<"anthropic-messages">, context: Context): boolean {
-	return !!context.tools?.length && !getAnthropicCompat(model).supportsEagerToolInputStreaming;
-}
-
-function convertTools(
-	tools: Tool[],
-	isOAuthToken: boolean,
-	supportsEagerToolInputStreaming: boolean,
-	cacheControl?: CacheControlEphemeral,
-): Anthropic.Messages.Tool[] {
-	if (!tools) return [];
-
-	return tools.map((tool, index) => {
-		const schema = tool.parameters as { properties?: unknown; required?: string[] };
-
-		return {
-			name: isOAuthToken ? toClaudeCodeName(tool.name) : tool.name,
-			description: tool.description,
-			...(supportsEagerToolInputStreaming ? { eager_input_streaming: true } : {}),
-			input_schema: {
-				type: "object",
-				properties: schema.properties ?? {},
-				required: schema.required ?? [],
-			},
-			...(cacheControl && index === tools.length - 1 ? { cache_control: cacheControl } : {}),
-		};
-	});
+function shouldUseFineGrainedToolStreamingBeta(_model: Model<"anthropic-messages">, _context: Context): boolean {
+	return false;
 }
 
 function mapStopReason(
@@ -1217,8 +1133,6 @@ function mapStopReason(
 			return { stopReason: "stop" };
 		case "max_tokens":
 			return { stopReason: "length" };
-		case "tool_use":
-			return { stopReason: "toolUse" };
 		case "refusal":
 			return {
 				stopReason: "error",

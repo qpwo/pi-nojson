@@ -8,7 +8,6 @@ import type {
 	ChatCompletionDeveloperMessageParam,
 	ChatCompletionMessageParam,
 	ChatCompletionSystemMessageParam,
-	ChatCompletionToolMessageParam,
 } from "openai/resources/chat/completions.js";
 import { calculateCost, clampThinkingLevel } from "../models.ts";
 import type {
@@ -16,7 +15,6 @@ import type {
 	CacheRetention,
 	Context,
 	ImageContent,
-	Message,
 	Model,
 	OpenAICompletionsCompat,
 	SimpleStreamOptions,
@@ -25,38 +23,23 @@ import type {
 	StreamOptions,
 	TextContent,
 	ThinkingContent,
-	Tool,
 	ToolCall,
 	ToolResultMessage,
 } from "../types.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
-import { parseStreamingJson } from "../utils/json-parse.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
+import {
+	contextWithTextToolProtocol,
+	formatToolResultText,
+	textToolCallForProvider,
+	wrapTextToolStream,
+} from "../utils/text-tools.ts";
 import { isCloudflareProvider, resolveCloudflareBaseUrl } from "./cloudflare.ts";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.ts";
 import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
 import { buildBaseOptions } from "./simple-options.ts";
 import { transformMessages } from "./transform-messages.ts";
-
-/**
- * Check if conversation messages contain tool calls or tool results.
- * This is needed because Anthropic (via proxy) requires the tools param
- * to be present when messages include tool_calls or tool role messages.
- */
-function hasToolHistory(messages: Message[]): boolean {
-	for (const msg of messages) {
-		if (msg.role === "toolResult") {
-			return true;
-		}
-		if (msg.role === "assistant") {
-			if (msg.content.some((block) => block.type === "toolCall")) {
-				return true;
-			}
-		}
-	}
-	return false;
-}
 
 function isTextContentBlock(block: { type: string }): block is TextContent {
 	return block.type === "text";
@@ -94,10 +77,6 @@ type ChatCompletionTextPartWithCacheControl = ChatCompletionContentPartText & {
 	cache_control?: OpenAICompatCacheControl;
 };
 
-type ChatCompletionToolWithCacheControl = OpenAI.Chat.Completions.ChatCompletionTool & {
-	cache_control?: OpenAICompatCacheControl;
-};
-
 function resolveCacheRetention(cacheRetention?: CacheRetention): CacheRetention {
 	if (cacheRetention) {
 		return cacheRetention;
@@ -113,6 +92,9 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 	context: Context,
 	options?: OpenAICompletionsOptions,
 ): AssistantMessageEventStream => {
+	const originalContext = context;
+	context = contextWithTextToolProtocol(context);
+
 	const stream = new AssistantMessageEventStream();
 
 	(async () => {
@@ -159,18 +141,11 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 			stream.push({ type: "start", partial: output });
 
-			interface StreamingToolCallBlock extends ToolCall {
-				partialArgs?: string;
-				streamIndex?: number;
-			}
-			type StreamingBlock = TextContent | ThinkingContent | StreamingToolCallBlock;
-			type StreamingToolCallDelta = NonNullable<ChatCompletionChunk.Choice.Delta["tool_calls"]>[number];
+			type StreamingBlock = TextContent | ThinkingContent;
 
 			let textBlock: TextContent | null = null;
 			let thinkingBlock: ThinkingContent | null = null;
 			let hasFinishReason = false;
-			const toolCallBlocksByIndex = new Map<number, StreamingToolCallBlock>();
-			const toolCallBlocksById = new Map<string, StreamingToolCallBlock>();
 			const blocks = output.content as StreamingBlock[];
 			const getContentIndex = (block: StreamingBlock) => blocks.indexOf(block);
 			const finishBlock = (block: StreamingBlock) => {
@@ -190,18 +165,6 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 						type: "thinking_end",
 						contentIndex,
 						content: block.thinking,
-						partial: output,
-					});
-				} else if (block.type === "toolCall") {
-					block.arguments = parseStreamingJson(block.partialArgs);
-					// Finalize in-place and strip the scratch buffers so replay only
-					// carries parsed arguments.
-					delete block.partialArgs;
-					delete block.streamIndex;
-					stream.push({
-						type: "toolcall_end",
-						contentIndex,
-						toolCall: block,
 						partial: output,
 					});
 				}
@@ -226,44 +189,6 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 				}
 				return thinkingBlock;
 			};
-			const ensureToolCallBlock = (toolCall: StreamingToolCallDelta) => {
-				const streamIndex = typeof toolCall.index === "number" ? toolCall.index : undefined;
-				let block = streamIndex !== undefined ? toolCallBlocksByIndex.get(streamIndex) : undefined;
-				if (!block && toolCall.id) {
-					block = toolCallBlocksById.get(toolCall.id);
-				}
-				if (!block) {
-					block = {
-						type: "toolCall",
-						id: toolCall.id || "",
-						name: toolCall.function?.name || "",
-						arguments: {},
-						partialArgs: "",
-						streamIndex,
-					};
-					if (streamIndex !== undefined) {
-						toolCallBlocksByIndex.set(streamIndex, block);
-					}
-					if (toolCall.id) {
-						toolCallBlocksById.set(toolCall.id, block);
-					}
-					blocks.push(block);
-					stream.push({
-						type: "toolcall_start",
-						contentIndex: getContentIndex(block),
-						partial: output,
-					});
-				}
-				if (streamIndex !== undefined && block.streamIndex === undefined) {
-					block.streamIndex = streamIndex;
-					toolCallBlocksByIndex.set(streamIndex, block);
-				}
-				if (toolCall.id) {
-					toolCallBlocksById.set(toolCall.id, block);
-				}
-				return block;
-			};
-
 			for await (const chunk of openaiStream) {
 				if (!chunk || typeof chunk !== "object") continue;
 
@@ -343,46 +268,6 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 							});
 						}
 					}
-
-					if (choice?.delta?.tool_calls) {
-						for (const toolCall of choice.delta.tool_calls) {
-							const block = ensureToolCallBlock(toolCall);
-							if (!block.id && toolCall.id) {
-								block.id = toolCall.id;
-								toolCallBlocksById.set(toolCall.id, block);
-							}
-							if (!block.name && toolCall.function?.name) {
-								block.name = toolCall.function.name;
-							}
-
-							let delta = "";
-							if (toolCall.function?.arguments) {
-								delta = toolCall.function.arguments;
-								block.partialArgs = (block.partialArgs ?? "") + toolCall.function.arguments;
-								block.arguments = parseStreamingJson(block.partialArgs);
-							}
-							stream.push({
-								type: "toolcall_delta",
-								contentIndex: getContentIndex(block),
-								delta,
-								partial: output,
-							});
-						}
-					}
-
-					const reasoningDetails = (choice.delta as any).reasoning_details;
-					if (reasoningDetails && Array.isArray(reasoningDetails)) {
-						for (const detail of reasoningDetails) {
-							if (detail.type === "reasoning.encrypted" && detail.id && detail.data) {
-								const matchingToolCall = output.content.find(
-									(b) => b.type === "toolCall" && b.id === detail.id,
-								) as ToolCall | undefined;
-								if (matchingToolCall) {
-									matchingToolCall.thoughtSignature = JSON.stringify(detail);
-								}
-							}
-						}
-					}
 				}
 			}
 
@@ -422,7 +307,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 		}
 	})();
 
-	return stream;
+	return wrapTextToolStream(stream, originalContext);
 };
 
 export const streamSimpleOpenAICompletions: StreamFunction<"openai-completions", SimpleStreamOptions> = (
@@ -535,23 +420,11 @@ function buildParams(
 		params.temperature = options.temperature;
 	}
 
-	if (context.tools && context.tools.length > 0) {
-		params.tools = convertTools(context.tools, compat);
-		if (compat.zaiToolStream) {
-			(params as any).tool_stream = true;
-		}
-	} else if (hasToolHistory(context.messages)) {
-		// Anthropic (via LiteLLM/proxy) requires tools param when conversation has tool_calls/tool_results
-		params.tools = [];
-	}
-
 	if (cacheControl) {
-		applyAnthropicCacheControl(messages, params.tools, cacheControl);
+		applyAnthropicCacheControl(params.messages, cacheControl);
 	}
 
-	if (options?.toolChoice) {
-		params.tool_choice = options.toolChoice;
-	}
+	// tools disabled natively
 
 	if (compat.thinkingFormat === "zai" && model.reasoning) {
 		const zaiParams = params as typeof params & { thinking?: { type: "enabled" | "disabled" } };
@@ -647,11 +520,9 @@ function getCompatCacheControl(
 
 function applyAnthropicCacheControl(
 	messages: ChatCompletionMessageParam[],
-	tools: OpenAI.Chat.Completions.ChatCompletionTool[] | undefined,
 	cacheControl: OpenAICompatCacheControl,
 ): void {
 	addCacheControlToSystemPrompt(messages, cacheControl);
-	addCacheControlToLastTool(tools, cacheControl);
 	addCacheControlToLastConversationMessage(messages, cacheControl);
 }
 
@@ -679,18 +550,6 @@ function addCacheControlToLastConversationMessage(
 			}
 		}
 	}
-}
-
-function addCacheControlToLastTool(
-	tools: OpenAI.Chat.Completions.ChatCompletionTool[] | undefined,
-	cacheControl: OpenAICompatCacheControl,
-): void {
-	if (!tools || tools.length === 0) {
-		return;
-	}
-
-	const lastTool = tools[tools.length - 1] as ChatCompletionToolWithCacheControl;
-	lastTool.cache_control = cacheControl;
 }
 
 function addCacheControlToInstructionMessage(
@@ -878,14 +737,16 @@ export function convertMessages(
 
 			const toolCalls = msg.content.filter(isToolCallBlock);
 			if (toolCalls.length > 0) {
-				assistantMsg.tool_calls = toolCalls.map((tc) => ({
-					id: tc.id,
-					type: "function" as const,
-					function: {
-						name: tc.name,
-						arguments: JSON.stringify(tc.arguments),
-					},
-				}));
+				const toolCallText = toolCalls
+					.map((tc) => sanitizeSurrogates(textToolCallForProvider(tc as ToolCall & { textToolRaw?: string })))
+					.join("\n\n");
+				if (toolCallText.length > 0) {
+					if (typeof assistantMsg.content === "string" && assistantMsg.content.length > 0) {
+						assistantMsg.content += `\n\n${toolCallText}`;
+					} else {
+						assistantMsg.content = toolCallText;
+					}
+				}
 				const reasoningDetails = toolCalls
 					.filter((tc) => tc.thoughtSignature)
 					.map((tc) => {
@@ -907,84 +768,48 @@ export function convertMessages(
 			) {
 				(assistantMsg as { reasoning_content?: string }).reasoning_content = "";
 			}
-			// Skip assistant messages that have no content and no tool calls.
-			// Some providers require "either content or tool_calls, but not none".
-			// Other providers also don't accept empty assistant messages.
-			// This handles aborted assistant responses that got no content.
+			// Skip assistant messages that have no content.
+			// Tool calls are serialized into text above in tool-free mode.
 			const content = assistantMsg.content;
 			const hasContent =
 				content !== null &&
 				content !== undefined &&
 				(typeof content === "string" ? content.length > 0 : content.length > 0);
-			if (!hasContent && !assistantMsg.tool_calls) {
+			if (!hasContent) {
 				continue;
 			}
 			params.push(assistantMsg);
 		} else if (msg.role === "toolResult") {
-			const imageBlocks: Array<{ type: "image_url"; image_url: { url: string } }> = [];
+			const content: ChatCompletionContentPart[] = [];
 			let j = i;
 
 			for (; j < transformedMessages.length && transformedMessages[j].role === "toolResult"; j++) {
 				const toolMsg = transformedMessages[j] as ToolResultMessage;
+				content.push({
+					type: "text",
+					text: sanitizeSurrogates(formatToolResultText(toolMsg)),
+				} satisfies ChatCompletionContentPartText);
 
-				// Extract text and image content
-				const textResult = toolMsg.content
-					.filter(isTextContentBlock)
-					.map((block) => block.text)
-					.join("\n");
-				const hasImages = toolMsg.content.some((c) => c.type === "image");
-
-				// Always send tool result with text (or placeholder if only images)
-				const hasText = textResult.length > 0;
-				// Some providers require the 'name' field in tool results
-				const toolResultMsg: ChatCompletionToolMessageParam = {
-					role: "tool",
-					content: sanitizeSurrogates(hasText ? textResult : "(see attached image)"),
-					tool_call_id: toolMsg.toolCallId,
-				};
-				if (compat.requiresToolResultName && toolMsg.toolName) {
-					(toolResultMsg as any).name = toolMsg.toolName;
-				}
-				params.push(toolResultMsg);
-
-				if (hasImages && model.input.includes("image")) {
+				if (model.input.includes("image")) {
 					for (const block of toolMsg.content) {
 						if (isImageContentBlock(block)) {
-							imageBlocks.push({
+							content.push({
 								type: "image_url",
 								image_url: {
 									url: `data:${block.mimeType};base64,${block.data}`,
 								},
-							});
+							} satisfies ChatCompletionContentPartImage);
 						}
 					}
 				}
 			}
 
 			i = j - 1;
-
-			if (imageBlocks.length > 0) {
-				if (compat.requiresAssistantAfterToolResult) {
-					params.push({
-						role: "assistant",
-						content: "I have processed the tool results.",
-					});
-				}
-
-				params.push({
-					role: "user",
-					content: [
-						{
-							type: "text",
-							text: "Attached image(s) from tool result:",
-						},
-						...imageBlocks,
-					],
-				});
-				lastRole = "user";
-			} else {
-				lastRole = "toolResult";
-			}
+			params.push({
+				role: "user",
+				content,
+			});
+			lastRole = "user";
 			continue;
 		}
 
@@ -992,22 +817,6 @@ export function convertMessages(
 	}
 
 	return params;
-}
-
-function convertTools(
-	tools: Tool[],
-	compat: ResolvedOpenAICompletionsCompat,
-): OpenAI.Chat.Completions.ChatCompletionTool[] {
-	return tools.map((tool) => ({
-		type: "function",
-		function: {
-			name: tool.name,
-			description: tool.description,
-			parameters: tool.parameters as any, // TypeBox already generates JSON Schema
-			// Only include strict if provider supports it. Some reject unknown fields.
-			...(compat.supportsStrictMode !== false && { strict: false }),
-		},
-	}));
 }
 
 function parseChunkUsage(
@@ -1057,9 +866,6 @@ function mapStopReason(reason: ChatCompletionChunk.Choice["finish_reason"] | str
 			return { stopReason: "stop" };
 		case "length":
 			return { stopReason: "length" };
-		case "function_call":
-		case "tool_calls":
-			return { stopReason: "toolUse" };
 		case "content_filter":
 			return { stopReason: "error", errorMessage: "Provider finish_reason: content_filter" };
 		case "network_error":
@@ -1145,7 +951,6 @@ function detectCompat(model: Model<"openai-completions">): ResolvedOpenAIComplet
 							: "openai",
 		openRouterRouting: {},
 		vercelGatewayRouting: {},
-		zaiToolStream: false,
 		supportsStrictMode: !isMoonshot && !isTogether && !isCloudflareAiGateway && !isNvidia,
 		cacheControlFormat,
 		sendSessionAffinityHeaders: false,
@@ -1183,7 +988,6 @@ function getCompat(model: Model<"openai-completions">): ResolvedOpenAICompletion
 		thinkingFormat: model.compat.thinkingFormat ?? detected.thinkingFormat,
 		openRouterRouting: model.compat.openRouterRouting ?? {},
 		vercelGatewayRouting: model.compat.vercelGatewayRouting ?? detected.vercelGatewayRouting,
-		zaiToolStream: model.compat.zaiToolStream ?? detected.zaiToolStream,
 		supportsStrictMode: model.compat.supportsStrictMode ?? detected.supportsStrictMode,
 		cacheControlFormat: model.compat.cacheControlFormat ?? detected.cacheControlFormat,
 		sendSessionAffinityHeaders: model.compat.sendSessionAffinityHeaders ?? detected.sendSessionAffinityHeaders,

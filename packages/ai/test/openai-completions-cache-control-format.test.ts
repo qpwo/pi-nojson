@@ -112,8 +112,7 @@ function expectAnthropicCacheMarkers(params: CapturedParams): void {
 	expect(Array.isArray(instructionMessage?.content)).toBe(true);
 	expect((instructionMessage?.content as TextPart[])[0]?.cache_control).toEqual({ type: "ephemeral" });
 
-	expect(params.tools).toHaveLength(1);
-	expect(params.tools?.[0]?.cache_control).toEqual({ type: "ephemeral" });
+	expect("tools" in params).toBe(false);
 
 	const lastMessage = params.messages[params.messages.length - 1];
 	expect(lastMessage.role).toBe("user");
@@ -183,7 +182,7 @@ describe("openai-completions cacheControlFormat", () => {
 		const instructionMessage = getInstructionMessage(params);
 
 		expect(Array.isArray(instructionMessage?.content)).toBe(false);
-		expect(params.tools?.[0]?.cache_control).toBeUndefined();
+		expect("tools" in params).toBe(false);
 		expect(typeof params.messages[params.messages.length - 1]?.content).toBe("string");
 	});
 });

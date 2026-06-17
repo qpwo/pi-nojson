@@ -211,10 +211,12 @@ describe("bedrock convertMessages skips unknown content types", () => {
 		const payload = await capturePayload({ messages });
 		expect(payload).toBeDefined();
 		const p = payload as {
-			messages: Array<{ role: string; content: Array<{ toolResult: { content: unknown[] } }> }>;
+			messages: Array<{ role: string; content: Array<{ text?: string }> }>;
 		};
 		expect(p.messages).toHaveLength(1);
-		expect(p.messages[0].content[0].toolResult.content).toEqual([{ text: "<empty>" }]);
+		expect(p.messages[0].role).toBe("user");
+		expect(p.messages[0].content[0].text).toContain("<tool_result");
+		expect(p.messages[0].content[0].text).toContain('name="tool"');
 	});
 
 	it("skips assistant messages with only unknown content blocks", async () => {

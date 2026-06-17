@@ -17,19 +17,12 @@ import type {
 	ThinkingBudgets,
 	ThinkingContent,
 	ThinkingLevel,
-	ToolCall,
 } from "../types.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
+import { contextWithTextToolProtocol, wrapTextToolStream } from "../utils/text-tools.ts";
 import type { GoogleThinkingLevel } from "./google-shared.ts";
-import {
-	convertMessages,
-	convertTools,
-	isThinkingPart,
-	mapStopReason,
-	mapToolChoice,
-	retainThoughtSignature,
-} from "./google-shared.ts";
+import { convertMessages, isThinkingPart, mapStopReason, retainThoughtSignature } from "./google-shared.ts";
 import { buildBaseOptions } from "./simple-options.ts";
 
 export interface GoogleOptions extends StreamOptions {
@@ -41,14 +34,25 @@ export interface GoogleOptions extends StreamOptions {
 	};
 }
 
-// Counter for generating unique tool call IDs
-let toolCallCounter = 0;
+function withGoogleDeveloperApiEnv<T>(fn: () => T): T {
+	const savedUseVertex = process.env.GOOGLE_GENAI_USE_VERTEXAI;
+	try {
+		delete process.env.GOOGLE_GENAI_USE_VERTEXAI;
+		return fn();
+	} finally {
+		if (savedUseVertex === undefined) delete process.env.GOOGLE_GENAI_USE_VERTEXAI;
+		else process.env.GOOGLE_GENAI_USE_VERTEXAI = savedUseVertex;
+	}
+}
 
 export const streamGoogle: StreamFunction<"google-generative-ai", GoogleOptions> = (
 	model: Model<"google-generative-ai">,
 	context: Context,
 	options?: GoogleOptions,
 ): AssistantMessageEventStream => {
+	const originalContext = context;
+	context = contextWithTextToolProtocol(context);
+
 	const stream = new AssistantMessageEventStream();
 
 	(async () => {
@@ -81,7 +85,7 @@ export const streamGoogle: StreamFunction<"google-generative-ai", GoogleOptions>
 			if (nextParams !== undefined) {
 				params = nextParams as GenerateContentParameters;
 			}
-			const googleStream = await client.models.generateContentStream(params);
+			const googleStream = await withGoogleDeveloperApiEnv(() => client.models.generateContentStream(params));
 
 			stream.push({ type: "start", partial: output });
 			let currentBlock: TextContent | ThinkingContent | null = null;
@@ -153,53 +157,6 @@ export const streamGoogle: StreamFunction<"google-generative-ai", GoogleOptions>
 									partial: output,
 								});
 							}
-						}
-
-						if (part.functionCall) {
-							if (currentBlock) {
-								if (currentBlock.type === "text") {
-									stream.push({
-										type: "text_end",
-										contentIndex: blockIndex(),
-										content: currentBlock.text,
-										partial: output,
-									});
-								} else {
-									stream.push({
-										type: "thinking_end",
-										contentIndex: blockIndex(),
-										content: currentBlock.thinking,
-										partial: output,
-									});
-								}
-								currentBlock = null;
-							}
-
-							// Generate unique ID if not provided or if it's a duplicate
-							const providedId = part.functionCall.id;
-							const needsNewId =
-								!providedId || output.content.some((b) => b.type === "toolCall" && b.id === providedId);
-							const toolCallId = needsNewId
-								? `${part.functionCall.name}_${Date.now()}_${++toolCallCounter}`
-								: providedId;
-
-							const toolCall: ToolCall = {
-								type: "toolCall",
-								id: toolCallId,
-								name: part.functionCall.name || "",
-								arguments: (part.functionCall.args as Record<string, any>) ?? {},
-								...(part.thoughtSignature && { thoughtSignature: part.thoughtSignature }),
-							};
-
-							output.content.push(toolCall);
-							stream.push({ type: "toolcall_start", contentIndex: blockIndex(), partial: output });
-							stream.push({
-								type: "toolcall_delta",
-								contentIndex: blockIndex(),
-								delta: JSON.stringify(toolCall.arguments),
-								partial: output,
-							});
-							stream.push({ type: "toolcall_end", contentIndex: blockIndex(), toolCall, partial: output });
 						}
 					}
 				}
@@ -274,7 +231,7 @@ export const streamGoogle: StreamFunction<"google-generative-ai", GoogleOptions>
 		}
 	})();
 
-	return stream;
+	return wrapTextToolStream(stream, originalContext);
 };
 
 export const streamSimpleGoogle: StreamFunction<"google-generative-ai", SimpleStreamOptions> = (
@@ -329,10 +286,13 @@ function createClient(
 		httpOptions.headers = { ...model.headers, ...optionsHeaders };
 	}
 
-	return new GoogleGenAI({
-		apiKey,
-		httpOptions: Object.keys(httpOptions).length > 0 ? httpOptions : undefined,
-	});
+	return withGoogleDeveloperApiEnv(
+		() =>
+			new GoogleGenAI({
+				apiKey,
+				httpOptions: Object.keys(httpOptions).length > 0 ? httpOptions : undefined,
+			}),
+	);
 }
 
 function buildParams(
@@ -353,18 +313,7 @@ function buildParams(
 	const config: GenerateContentConfig = {
 		...(Object.keys(generationConfig).length > 0 && generationConfig),
 		...(context.systemPrompt && { systemInstruction: sanitizeSurrogates(context.systemPrompt) }),
-		...(context.tools && context.tools.length > 0 && { tools: convertTools(context.tools) }),
 	};
-
-	if (context.tools && context.tools.length > 0 && options.toolChoice) {
-		config.toolConfig = {
-			functionCallingConfig: {
-				mode: mapToolChoice(options.toolChoice),
-			},
-		};
-	} else {
-		config.toolConfig = undefined;
-	}
 
 	if (options.thinking?.enabled && model.reasoning) {
 		const thinkingConfig: ThinkingConfig = { includeThoughts: true };

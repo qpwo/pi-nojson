@@ -173,18 +173,15 @@ async function captureAnthropicRequest(
 	return capturedRequest;
 }
 
-function getTools(body: Record<string, unknown>): Record<string, unknown>[] {
-	const tools = body.tools;
-	if (!Array.isArray(tools)) {
-		throw new Error("Expected tools in request body");
-	}
-	return tools as Record<string, unknown>[];
+function expectNoNativeTools(body: Record<string, unknown>): void {
+	expect(body.tools).toBeUndefined();
+	expect(JSON.stringify(body.system)).toContain("Enabled tool names: lookup");
+	expect(JSON.stringify(body.system)).toContain("value");
 }
 
-describe("Fireworks Anthropic session affinity and tool compat", () => {
+describe("Fireworks Anthropic session affinity and text-tool compat", () => {
 	it("sends x-session-affinity header for Fireworks models", async () => {
 		const model = createFireworksModel();
-		// Need a real port, capture will assign one
 		const request = await captureAnthropicRequest(model, createContext(), {
 			sessionId: "fireworks-session-1",
 		});
@@ -211,40 +208,17 @@ describe("Fireworks Anthropic session affinity and tool compat", () => {
 		expect(request.headers["x-session-affinity"]).toBeUndefined();
 	});
 
-	it("omits cache_control on tools for Fireworks models", async () => {
+	it("omits native tools for Fireworks models", async () => {
 		const model = createFireworksModel();
 		const request = await captureAnthropicRequest(model, createContext());
 
-		const tools = getTools(request.body);
-		const lastTool = tools[tools.length - 1];
-		expect(lastTool.cache_control).toBeUndefined();
+		expectNoNativeTools(request.body);
 	});
 
-	it("omits eager_input_streaming on tools for Fireworks models", async () => {
-		const model = createFireworksModel();
-		const request = await captureAnthropicRequest(model, createContext());
-
-		const tools = getTools(request.body);
-		for (const t of tools) {
-			expect(t.eager_input_streaming).toBeUndefined();
-		}
-	});
-
-	it("sends cache_control on tools for native Anthropic models", async () => {
+	it("omits native tools for native Anthropic models", async () => {
 		const model = createAnthropicModel();
 		const request = await captureAnthropicRequest(model, createContext());
 
-		const tools = getTools(request.body);
-		const lastTool = tools[tools.length - 1];
-		expect(lastTool.cache_control).toBeDefined();
-		expect((lastTool.cache_control as { type: string }).type).toBe("ephemeral");
-	});
-
-	it("sends eager_input_streaming on tools for native Anthropic models", async () => {
-		const model = createAnthropicModel();
-		const request = await captureAnthropicRequest(model, createContext());
-
-		const tools = getTools(request.body);
-		expect(tools[0].eager_input_streaming).toBe(true);
+		expectNoNativeTools(request.body);
 	});
 });

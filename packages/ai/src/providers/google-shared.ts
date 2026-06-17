@@ -3,8 +3,9 @@
  */
 
 import { type Content, FinishReason, FunctionCallingConfigMode, type Part } from "@google/genai";
-import type { Context, ImageContent, Model, StopReason, TextContent, Tool } from "../types.ts";
+import type { Context, ImageContent, Model, StopReason } from "../types.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
+import { formatToolResultText, textToolCallForProvider } from "../utils/text-tools.ts";
 import { transformMessages } from "./transform-messages.ts";
 
 type GoogleApiType = "google-generative-ai" | "google-vertex";
@@ -22,9 +23,9 @@ export type GoogleThinkingLevel = "THINKING_LEVEL_UNSPECIFIED" | "MINIMAL" | "LO
  * - `thought: true` is the definitive marker for thinking content (thought summaries).
  * - `thoughtSignature` is an encrypted representation of the model's internal thought process
  *   used to preserve reasoning context across multi-turn interactions.
- * - `thoughtSignature` can appear on ANY part type (text, functionCall, etc.) - it does NOT
+ * - `thoughtSignature` can appear on ANY part type (text, tool-call, etc.) - it does NOT
  *   indicate the part itself is thinking content.
- * - For non-functionCall responses, the signature appears on the last part for context replay.
+ * - For non-tool-call responses, the signature appears on the last part for context replay.
  * - When persisting/replaying model outputs, signature-bearing parts must be preserved as-is;
  *   do not merge/move signatures across parts.
  *
@@ -77,7 +78,7 @@ function getGeminiMajorVersion(modelId: string): number | undefined {
 	return Number.parseInt(match[1], 10);
 }
 
-function supportsMultimodalFunctionResponse(modelId: string): boolean {
+function _supportsMultimodalFunctionResponse(modelId: string): boolean {
 	const geminiMajorVersion = getGeminiMajorVersion(modelId);
 	if (geminiMajorVersion !== undefined) {
 		return geminiMajorVersion >= 3;
@@ -156,15 +157,10 @@ export function convertMessages<T extends GoogleApiType>(model: Model<T>, contex
 					}
 				} else if (block.type === "toolCall") {
 					const thoughtSignature = resolveThoughtSignature(isSameProviderAndModel, block.thoughtSignature);
-					const part: Part = {
-						functionCall: {
-							name: block.name,
-							args: block.arguments ?? {},
-							...(requiresToolCallId(model.id) ? { id: block.id } : {}),
-						},
+					parts.push({
+						text: sanitizeSurrogates(textToolCallForProvider(block)),
 						...(thoughtSignature && { thoughtSignature }),
-					};
-					parts.push(part);
+					});
 				}
 			}
 
@@ -174,58 +170,35 @@ export function convertMessages<T extends GoogleApiType>(model: Model<T>, contex
 				parts,
 			});
 		} else if (msg.role === "toolResult") {
-			// Extract text and image content
-			const textContent = msg.content.filter((c): c is TextContent => c.type === "text");
-			const textResult = textContent.map((c) => c.text).join("\n");
-			const imageContent = model.input.includes("image")
-				? msg.content.filter((c): c is ImageContent => c.type === "image")
-				: [];
-
-			const hasText = textResult.length > 0;
-			const hasImages = imageContent.length > 0;
-
-			// Gemini 3+ models support multimodal function responses with images nested inside
-			// functionResponse.parts. Claude and other non-Gemini models behind Cloud Code Assist /
-			// Gemini < 3 still needs a separate user image turn.
-			const modelSupportsMultimodalFunctionResponse = supportsMultimodalFunctionResponse(model.id);
-
-			// Use "output" key for success, "error" key for errors as per SDK documentation
-			const responseValue = hasText ? sanitizeSurrogates(textResult) : hasImages ? "(see attached image)" : "";
-
-			const imageParts: Part[] = imageContent.map((imageBlock) => ({
-				inlineData: {
-					mimeType: imageBlock.mimeType,
-					data: imageBlock.data,
+			const parts: Part[] = [
+				{
+					text: sanitizeSurrogates(formatToolResultText(msg)),
 				},
-			}));
+			];
 
-			const includeId = requiresToolCallId(model.id);
-			const functionResponsePart: Part = {
-				functionResponse: {
-					name: msg.toolName,
-					response: msg.isError ? { error: responseValue } : { output: responseValue },
-					...(hasImages && modelSupportsMultimodalFunctionResponse && { parts: imageParts }),
-					...(includeId ? { id: msg.toolCallId } : {}),
-				},
-			};
+			if (model.input.includes("image")) {
+				const imageContent = msg.content.filter((c): c is ImageContent => c.type === "image");
+				for (const imageBlock of imageContent) {
+					parts.push({
+						inlineData: {
+							mimeType: imageBlock.mimeType,
+							data: imageBlock.data,
+						},
+					});
+				}
+			}
 
-			// Cloud Code Assist API requires all function responses to be in a single user turn.
-			// Check if the last content is already a user turn with function responses and merge.
 			const lastContent = contents[contents.length - 1];
-			if (lastContent?.role === "user" && lastContent.parts?.some((p) => p.functionResponse)) {
-				lastContent.parts.push(functionResponsePart);
+			const canMergeWithLastToolResultUserTurn =
+				lastContent?.role === "user" &&
+				lastContent.parts?.some((p) => typeof p.text === "string" && p.text.includes("<tool_results>"));
+
+			if (canMergeWithLastToolResultUserTurn && lastContent.parts) {
+				lastContent.parts.push(...parts);
 			} else {
 				contents.push({
 					role: "user",
-					parts: [functionResponsePart],
-				});
-			}
-
-			// For Gemini < 3, add images in a separate user message
-			if (hasImages && !modelSupportsMultimodalFunctionResponse) {
-				contents.push({
-					role: "user",
-					parts: [{ text: "Tool result image:" }, ...imageParts],
+					parts,
 				});
 			}
 		}
@@ -248,7 +221,7 @@ const JSON_SCHEMA_META_DECLARATIONS = new Set([
 /**
  * Strip meta-declarations from a schema obj
  */
-function sanitizeForOpenApi(schema: unknown): unknown {
+function _sanitizeForOpenApi(schema: unknown): unknown {
 	if (typeof schema !== "object" || schema === null || Array.isArray(schema)) {
 		return schema;
 	}
@@ -256,35 +229,9 @@ function sanitizeForOpenApi(schema: unknown): unknown {
 	const result: Record<string, unknown> = {};
 	for (const [key, value] of Object.entries(schema)) {
 		if (JSON_SCHEMA_META_DECLARATIONS.has(key)) continue;
-		result[key] = sanitizeForOpenApi(value);
+		result[key] = _sanitizeForOpenApi(value);
 	}
 	return result;
-}
-
-/**
- * Convert tools to Gemini function declarations format.
- *
- * By default uses `parametersJsonSchema` which supports full JSON Schema (including
- * anyOf, oneOf, const, etc.). Set `useParameters` to true to use the legacy `parameters`
- * field instead (OpenAPI 3.03 Schema). This is needed for Cloud Code Assist with Claude
- * models, where the API translates `parameters` into Anthropic's `input_schema`.
- */
-export function convertTools(
-	tools: Tool[],
-	useParameters = false,
-): { functionDeclarations: Record<string, unknown>[] }[] | undefined {
-	if (tools.length === 0) return undefined;
-	return [
-		{
-			functionDeclarations: tools.map((tool) => ({
-				name: tool.name,
-				description: tool.description,
-				...(useParameters
-					? { parameters: sanitizeForOpenApi(tool.parameters as unknown) }
-					: { parametersJsonSchema: tool.parameters }),
-			})),
-		},
-	];
 }
 
 /**

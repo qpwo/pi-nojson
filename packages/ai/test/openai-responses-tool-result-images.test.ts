@@ -1,7 +1,6 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ResponseFunctionCallOutputItemList } from "openai/resources/responses/responses.js";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 import type { Api, Context, Model, StreamOptions, Tool, ToolResultMessage } from "../src/index.ts";
@@ -32,10 +31,8 @@ function isResponsePayload(value: unknown): value is { input: unknown[] } {
 	return isRecord(value) && Array.isArray(value.input);
 }
 
-function isFunctionCallOutputItem(
-	value: unknown,
-): value is { type: "function_call_output"; output: string | ResponseFunctionCallOutputItemList } {
-	return isRecord(value) && value.type === "function_call_output" && "output" in value;
+function isToolResultUserMessage(value: unknown): value is { role: "user"; content: unknown[] } {
+	return isRecord(value) && value.role === "user" && Array.isArray(value.content);
 }
 
 function isInputTextItem(value: unknown): value is { type: "input_text"; text: string } {
@@ -46,7 +43,7 @@ function isInputImageItem(value: unknown): value is { type: "input_image"; image
 	return isRecord(value) && value.type === "input_image" && typeof value.image_url === "string";
 }
 
-async function verifyToolResultImagesStayInFunctionCallOutput<TApi extends Api>(
+async function verifyToolResultImagesStayInUserMessage<TApi extends Api>(
 	model: Model<TApi>,
 	options?: StreamOptionsWithExtras,
 ) {
@@ -110,33 +107,34 @@ async function verifyToolResultImagesStayInFunctionCallOutput<TApi extends Api>(
 		throw new Error("Expected payload with input array");
 	}
 
-	const functionCallOutputIndex = capturedPayload.input.findIndex((item) => isFunctionCallOutputItem(item));
-	expect(functionCallOutputIndex).toBeGreaterThanOrEqual(0);
-	const functionCallOutput = capturedPayload.input[functionCallOutputIndex];
-	if (!isFunctionCallOutputItem(functionCallOutput)) {
-		throw new Error("Expected function_call_output item");
+	const toolResultUserIndex = capturedPayload.input.findIndex(
+		(item) =>
+			isToolResultUserMessage(item) &&
+			item.content.some((part) => isInputTextItem(part) && part.text.includes("<tool_results>")) &&
+			item.content.some((part) => isInputImageItem(part)),
+	);
+	expect(toolResultUserIndex).toBeGreaterThanOrEqual(0);
+	const toolResultUser = capturedPayload.input[toolResultUserIndex];
+	if (!isToolResultUserMessage(toolResultUser)) {
+		throw new Error("Expected user message carrying tool results");
 	}
 
-	expect(Array.isArray(functionCallOutput.output)).toBe(true);
-	if (!Array.isArray(functionCallOutput.output)) {
-		throw new Error("Expected function_call_output output to be a content array");
-	}
-
-	const outputItems = functionCallOutput.output;
+	const outputItems = toolResultUser.content;
 	const textItem = outputItems.find((item) => isInputTextItem(item));
 	const imageItem = outputItems.find((item) => isInputImageItem(item));
 
 	expect(textItem).toBeTruthy();
 	expect(imageItem).toBeTruthy();
 	if (!textItem || !imageItem) {
-		throw new Error("Expected both input_text and input_image in function_call_output");
+		throw new Error("Expected both input_text and input_image in tool-result user message");
 	}
 
+	expect(textItem.text).toContain("<tool_results>");
 	expect(textItem.text).toContain(toolText);
 	expect(imageItem.image_url.startsWith("data:image/png;base64,")).toBe(true);
 
 	const laterUserMessages = capturedPayload.input
-		.slice(functionCallOutputIndex + 1)
+		.slice(toolResultUserIndex + 1)
 		.filter((item) => isRecord(item) && item.role === "user");
 	expect(laterUserMessages).toHaveLength(0);
 
@@ -153,8 +151,8 @@ describe("Responses API tool result images", () => {
 	describe.skipIf(!process.env.OPENAI_API_KEY)("OpenAI Responses Provider (gpt-5-mini)", () => {
 		const model = getModel("openai", "gpt-5-mini");
 
-		it("should send tool result images in function_call_output", { retry: 3, timeout: 30000 }, async () => {
-			await verifyToolResultImagesStayInFunctionCallOutput(model, { reasoningEffort: "low" });
+		it("should send tool result images in tool-result user messages", { retry: 3, timeout: 30000 }, async () => {
+			await verifyToolResultImagesStayInUserMessage(model, { reasoningEffort: "low" });
 		});
 	});
 
@@ -163,8 +161,8 @@ describe("Responses API tool result images", () => {
 		const azureDeploymentName = resolveAzureDeploymentName(model.id);
 		const azureOptions = azureDeploymentName ? { azureDeploymentName } : {};
 
-		it("should send tool result images in function_call_output", { retry: 3, timeout: 30000 }, async () => {
-			await verifyToolResultImagesStayInFunctionCallOutput(model, azureOptions);
+		it("should send tool result images in tool-result user messages", { retry: 3, timeout: 30000 }, async () => {
+			await verifyToolResultImagesStayInUserMessage(model, azureOptions);
 		});
 	});
 
@@ -172,10 +170,10 @@ describe("Responses API tool result images", () => {
 		const model = getModel("github-copilot", "gpt-5-mini");
 
 		it.skipIf(!githubCopilotToken)(
-			"should send tool result images in function_call_output",
+			"should send tool result images in tool-result user messages",
 			{ retry: 3, timeout: 30000 },
 			async () => {
-				await verifyToolResultImagesStayInFunctionCallOutput(model, {
+				await verifyToolResultImagesStayInUserMessage(model, {
 					apiKey: githubCopilotToken,
 					reasoningEffort: "low",
 				});
@@ -187,10 +185,10 @@ describe("Responses API tool result images", () => {
 		const model = getModel("openai-codex", "gpt-5.5");
 
 		it.skipIf(!openaiCodexToken)(
-			"should send tool result images in function_call_output",
+			"should send tool result images in tool-result user messages",
 			{ retry: 3, timeout: 30000 },
 			async () => {
-				await verifyToolResultImagesStayInFunctionCallOutput(model, {
+				await verifyToolResultImagesStayInUserMessage(model, {
 					apiKey: openaiCodexToken,
 					reasoningEffort: "low",
 				});

@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import { getModel } from "../src/models.ts";
 import { convertResponsesMessages } from "../src/providers/openai-responses-shared.ts";
 import type { AssistantMessage, Context, ToolResultMessage, Usage } from "../src/types.ts";
-import { shortHash } from "../src/utils/hash.ts";
 
 const COPILOT_RAW_TOOL_CALL_ID =
 	"call_4VnzVawQXPB9MgYib7CiQFEY|I9b95oN1wD/cHXKTw3PpRkL6KkCtzTJhUxMouMWYwHeTo2j3htzfSk7YPx2vifiIM4g3A8XXyOj8q4Bt6SLUG7gqY1E3ELkrkVQNHglRfUmWj84lqxJY+Puieb3VKyX0FB+83TUzn91cDMF/4gzt990IzqVrc+nIb9RRscRD070Du16q1glydVjWR0SBJsE6TbY/esOjFpqplogQqrajm1eI++f3eLi73R6q7hVusY0QbeFySVxABCjhN0lXB04caBe1rzHjYzul6MAXj7uq+0r17VLq+yrtyYhN12wkmFqHeqTyEei6EFPbMy24Nc+IbJlkP0OCg02W+gOnyBFcbi2ctvJFSOhSjt1CqBdqCnnhwUqXjbWiT0wh3DmLScRgTHmGkaI+oAcQQjfic65nxj+TnEkReA==";
@@ -52,15 +51,10 @@ describe("OpenAI Responses foreign tool call ID normalization", () => {
 		const input = convertResponsesMessages(model, context, new Set(["openai", "openai-codex", "opencode"]));
 		const functionCall = input.find((item) => item.type === "function_call");
 
-		expect(functionCall).toBeDefined();
-		expect(functionCall?.type).toBe("function_call");
-		if (!functionCall || functionCall.type !== "function_call") {
-			throw new Error("Expected function_call item");
-		}
-
-		const expectedItemId = `fc_${shortHash(COPILOT_RAW_TOOL_CALL_ID.split("|")[1]!)}`;
-		expect(functionCall.id).toBe(expectedItemId);
-		expect(functionCall.id?.length ?? 0).toBeLessThanOrEqual(64);
-		expect(functionCall.id).toMatch(/^fc_[A-Za-z0-9]+$/);
+		expect(functionCall).toBeUndefined();
+		expect(input.find((item) => item.type === "function_call_output")).toBeUndefined();
+		expect(JSON.stringify(input)).toContain("<edit");
+		expect(JSON.stringify(input)).toContain("src/styles/app.css");
+		expect(JSON.stringify(input)).toContain("<tool_results>");
 	});
 });

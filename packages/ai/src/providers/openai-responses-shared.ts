@@ -1,9 +1,6 @@
 import type OpenAI from "openai";
 import type {
-	Tool as OpenAITool,
 	ResponseCreateParamsStreaming,
-	ResponseFunctionCallOutputItemList,
-	ResponseFunctionToolCall,
 	ResponseInput,
 	ResponseInputContent,
 	ResponseInputImage,
@@ -17,19 +14,16 @@ import type {
 	Api,
 	AssistantMessage,
 	Context,
-	ImageContent,
 	Model,
 	StopReason,
 	TextContent,
 	TextSignatureV1,
 	ThinkingContent,
-	Tool,
 	ToolCall,
 	Usage,
 } from "../types.ts";
 import type { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
-import { parseStreamingJson } from "../utils/json-parse.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import { transformMessages } from "./transform-messages.ts";
 
@@ -77,10 +71,6 @@ export interface OpenAIResponsesStreamOptions {
 
 export interface ConvertResponsesMessagesOptions {
 	includeSystemPrompt?: boolean;
-}
-
-export interface ConvertResponsesToolsOptions {
-	strict?: boolean | null;
 }
 
 // =============================================================================
@@ -163,7 +153,7 @@ export function convertResponsesMessages<TApi extends Api>(
 		} else if (msg.role === "assistant") {
 			const output: ResponseInput = [];
 			const assistantMsg = msg as AssistantMessage;
-			const isDifferentModel =
+			const _isDifferentModel =
 				assistantMsg.model !== model.id &&
 				assistantMsg.provider === model.provider &&
 				assistantMsg.api === model.api;
@@ -173,7 +163,9 @@ export function convertResponsesMessages<TApi extends Api>(
 				if (block.type === "thinking") {
 					if (block.thinkingSignature) {
 						const reasoningItem = JSON.parse(block.thinkingSignature) as ResponseReasoningItem;
-						output.push(reasoningItem);
+						const reasoningWithoutId: Record<string, unknown> = { ...reasoningItem };
+						delete reasoningWithoutId.id;
+						output.push(reasoningWithoutId as unknown as ResponseReasoningItem);
 					}
 				} else if (block.type === "text") {
 					const textBlock = block as TextContent;
@@ -197,88 +189,60 @@ export function convertResponsesMessages<TApi extends Api>(
 						phase: parsedSignature?.phase,
 					} satisfies ResponseOutputMessage);
 				} else if (block.type === "toolCall") {
-					const toolCall = block as ToolCall;
-					const [callId, itemIdRaw] = toolCall.id.split("|");
-					let itemId: string | undefined = itemIdRaw;
-
-					// For different-model messages, set id to undefined to avoid pairing validation.
-					// OpenAI tracks which fc_xxx IDs were paired with rs_xxx reasoning items.
-					// By omitting the id, we avoid triggering that validation (like cross-provider does).
-					if (isDifferentModel && itemId?.startsWith("fc_")) {
-						itemId = undefined;
+					const toolCall = block as ToolCall & { textToolRaw?: string };
+					let toolText = toolCall.textToolRaw;
+					if (!toolText) {
+						toolText = `<${toolCall.name}>\n${JSON.stringify(toolCall.arguments)}\n</${toolCall.name}>`;
 					}
-
 					output.push({
-						type: "function_call",
-						id: itemId,
-						call_id: callId,
-						name: toolCall.name,
-						arguments: JSON.stringify(toolCall.arguments),
+						type: "message",
+						role: "assistant",
+						status: "completed",
+						id: `msg_${msgIndex}`,
+						content: [{ type: "output_text", text: sanitizeSurrogates(toolText), annotations: [] }],
 					});
 				}
 			}
 			if (output.length === 0) continue;
 			messages.push(...output);
 		} else if (msg.role === "toolResult") {
-			const textResult = msg.content
-				.filter((c): c is TextContent => c.type === "text")
-				.map((c) => c.text)
+			const textContent = msg.content
+				.filter((b) => b.type === "text")
+				.map((b) => (b as TextContent).text)
 				.join("\n");
-			const hasImages = msg.content.some((c): c is ImageContent => c.type === "image");
-			const hasText = textResult.length > 0;
-			const [callId] = msg.toolCallId.split("|");
+			const safeText = String(textContent || "")
+				.split("</tool_result>")
+				.join("</ tool_result>")
+				.split("</tool_results>")
+				.join("</ tool_results>");
+			const txt = `<tool_results>\n<tool_result id="${msg.toolCallId || ""}" name="${msg.toolName || ""}" is_error="${msg.isError ? "true" : "false"}">\n${safeText}\n</tool_result>\n</tool_results>`;
 
-			let output: string | ResponseFunctionCallOutputItemList;
-			if (hasImages && model.input.includes("image")) {
-				const contentParts: ResponseFunctionCallOutputItemList = [];
+			const parts: any[] = [];
+			if (txt) {
+				parts.push({ type: "input_text", text: sanitizeSurrogates(txt) });
+			}
 
-				if (hasText) {
-					contentParts.push({
-						type: "input_text",
-						text: sanitizeSurrogates(textResult),
-					});
-				}
-
+			if (model.input.includes("image")) {
 				for (const block of msg.content) {
 					if (block.type === "image") {
-						contentParts.push({
+						parts.push({
 							type: "input_image",
 							detail: "auto",
 							image_url: `data:${block.mimeType};base64,${block.data}`,
 						});
 					}
 				}
-
-				output = contentParts;
-			} else {
-				output = sanitizeSurrogates(hasText ? textResult : "(see attached image)");
 			}
 
 			messages.push({
-				type: "function_call_output",
-				call_id: callId,
-				output,
+				role: "user",
+				content: parts,
 			});
 		}
 		msgIndex++;
 	}
 
 	return messages;
-}
-
-// =============================================================================
-// Tool conversion
-// =============================================================================
-
-export function convertResponsesTools(tools: Tool[], options?: ConvertResponsesToolsOptions): OpenAITool[] {
-	const strict = options?.strict === undefined ? false : options.strict;
-	return tools.map((tool) => ({
-		type: "function",
-		name: tool.name,
-		description: tool.description,
-		parameters: tool.parameters as any, // TypeBox already generates JSON Schema
-		strict,
-	}));
 }
 
 // =============================================================================
@@ -292,8 +256,8 @@ export async function processResponsesStream<TApi extends Api>(
 	model: Model<TApi>,
 	options?: OpenAIResponsesStreamOptions,
 ): Promise<void> {
-	let currentItem: ResponseReasoningItem | ResponseOutputMessage | ResponseFunctionToolCall | null = null;
-	let currentBlock: ThinkingContent | TextContent | (ToolCall & { partialJson: string }) | null = null;
+	let currentItem: ResponseReasoningItem | ResponseOutputMessage | null = null;
+	let currentBlock: ThinkingContent | TextContent | null = null;
 	const blocks = output.content;
 	const blockIndex = () => blocks.length - 1;
 
@@ -312,17 +276,6 @@ export async function processResponsesStream<TApi extends Api>(
 				currentBlock = { type: "text", text: "" };
 				output.content.push(currentBlock);
 				stream.push({ type: "text_start", contentIndex: blockIndex(), partial: output });
-			} else if (item.type === "function_call") {
-				currentItem = item;
-				currentBlock = {
-					type: "toolCall",
-					id: `${item.call_id}|${item.id}`,
-					name: item.name,
-					arguments: {},
-					partialJson: item.arguments || "",
-				};
-				output.content.push(currentBlock);
-				stream.push({ type: "toolcall_start", contentIndex: blockIndex(), partial: output });
 			}
 		} else if (event.type === "response.reasoning_summary_part.added") {
 			if (currentItem && currentItem.type === "reasoning") {
@@ -372,16 +325,13 @@ export async function processResponsesStream<TApi extends Api>(
 		} else if (event.type === "response.content_part.added") {
 			if (currentItem?.type === "message") {
 				currentItem.content = currentItem.content || [];
-				// Filter out ReasoningText, only accept output_text and refusal
 				if (event.part.type === "output_text" || event.part.type === "refusal") {
 					currentItem.content.push(event.part);
 				}
 			}
 		} else if (event.type === "response.output_text.delta") {
 			if (currentItem?.type === "message" && currentBlock?.type === "text") {
-				if (!currentItem.content || currentItem.content.length === 0) {
-					continue;
-				}
+				if (!currentItem.content || currentItem.content.length === 0) continue;
 				const lastPart = currentItem.content[currentItem.content.length - 1];
 				if (lastPart?.type === "output_text") {
 					currentBlock.text += event.delta;
@@ -396,9 +346,7 @@ export async function processResponsesStream<TApi extends Api>(
 			}
 		} else if (event.type === "response.refusal.delta") {
 			if (currentItem?.type === "message" && currentBlock?.type === "text") {
-				if (!currentItem.content || currentItem.content.length === 0) {
-					continue;
-				}
+				if (!currentItem.content || currentItem.content.length === 0) continue;
 				const lastPart = currentItem.content[currentItem.content.length - 1];
 				if (lastPart?.type === "refusal") {
 					currentBlock.text += event.delta;
@@ -411,43 +359,22 @@ export async function processResponsesStream<TApi extends Api>(
 					});
 				}
 			}
-		} else if (event.type === "response.function_call_arguments.delta") {
-			if (currentItem?.type === "function_call" && currentBlock?.type === "toolCall") {
-				currentBlock.partialJson += event.delta;
-				currentBlock.arguments = parseStreamingJson(currentBlock.partialJson);
-				stream.push({
-					type: "toolcall_delta",
-					contentIndex: blockIndex(),
-					delta: event.delta,
-					partial: output,
-				});
-			}
-		} else if (event.type === "response.function_call_arguments.done") {
-			if (currentItem?.type === "function_call" && currentBlock?.type === "toolCall") {
-				const previousPartialJson = currentBlock.partialJson;
-				currentBlock.partialJson = event.arguments;
-				currentBlock.arguments = parseStreamingJson(currentBlock.partialJson);
-
-				if (event.arguments.startsWith(previousPartialJson)) {
-					const delta = event.arguments.slice(previousPartialJson.length);
-					if (delta.length > 0) {
-						stream.push({
-							type: "toolcall_delta",
-							contentIndex: blockIndex(),
-							delta,
-							partial: output,
-						});
-					}
-				}
-			}
 		} else if (event.type === "response.output_item.done") {
 			const item = event.item;
-
 			if (item.type === "reasoning" && currentBlock?.type === "thinking") {
-				const summaryText = item.summary?.map((s) => s.text).join("\n\n") || "";
-				const contentText = item.content?.map((c) => c.text).join("\n\n") || "";
-				currentBlock.thinking = summaryText || contentText || currentBlock.thinking;
+				const summaryText = item.summary?.map((part) => part.text).join("\n\n") || "";
+				const contentText = item.content?.map((part) => part.text).join("\n\n") || "";
+				const previousThinking = currentBlock.thinking;
+				currentBlock.thinking = summaryText || contentText || previousThinking;
 				currentBlock.thinkingSignature = JSON.stringify(item);
+				if (!previousThinking && currentBlock.thinking) {
+					stream.push({
+						type: "thinking_delta",
+						contentIndex: blockIndex(),
+						delta: currentBlock.thinking,
+						partial: output,
+					});
+				}
 				stream.push({
 					type: "thinking_end",
 					contentIndex: blockIndex(),
@@ -456,7 +383,9 @@ export async function processResponsesStream<TApi extends Api>(
 				});
 				currentBlock = null;
 			} else if (item.type === "message" && currentBlock?.type === "text") {
-				currentBlock.text = item.content.map((c) => (c.type === "output_text" ? c.text : c.refusal)).join("");
+				currentBlock.text = item.content
+					.map((part) => (part.type === "output_text" ? part.text : part.refusal))
+					.join("");
 				currentBlock.textSignature = encodeTextSignatureV1(item.id, item.phase ?? undefined);
 				stream.push({
 					type: "text_end",
@@ -465,40 +394,13 @@ export async function processResponsesStream<TApi extends Api>(
 					partial: output,
 				});
 				currentBlock = null;
-			} else if (item.type === "function_call") {
-				const args =
-					currentBlock?.type === "toolCall" && currentBlock.partialJson
-						? parseStreamingJson(currentBlock.partialJson)
-						: parseStreamingJson(item.arguments || "{}");
-
-				let toolCall: ToolCall;
-				if (currentBlock?.type === "toolCall") {
-					// Finalize in-place and strip the scratch buffer so replay only
-					// carries parsed arguments.
-					currentBlock.arguments = args;
-					delete (currentBlock as { partialJson?: string }).partialJson;
-					toolCall = currentBlock;
-				} else {
-					toolCall = {
-						type: "toolCall",
-						id: `${item.call_id}|${item.id}`,
-						name: item.name,
-						arguments: args,
-					};
-				}
-
-				currentBlock = null;
-				stream.push({ type: "toolcall_end", contentIndex: blockIndex(), toolCall, partial: output });
 			}
 		} else if (event.type === "response.completed") {
 			const response = event.response;
-			if (response?.id) {
-				output.responseId = response.id;
-			}
+			if (response?.id) output.responseId = response.id;
 			if (response?.usage) {
 				const cachedTokens = response.usage.input_tokens_details?.cached_tokens || 0;
 				output.usage = {
-					// OpenAI includes cached tokens in input_tokens, so subtract to get non-cached input
 					input: (response.usage.input_tokens || 0) - cachedTokens,
 					output: response.usage.output_tokens || 0,
 					cacheRead: cachedTokens,
@@ -514,9 +416,8 @@ export async function processResponsesStream<TApi extends Api>(
 					: (response?.service_tier ?? options.serviceTier);
 				options.applyServiceTierPricing(output.usage, serviceTier);
 			}
-			// Map status to stop reason
 			output.stopReason = mapStopReason(response?.status);
-			if (output.content.some((b) => b.type === "toolCall") && output.stopReason === "stop") {
+			if (output.content.some((block) => block.type === "toolCall") && output.stopReason === "stop") {
 				output.stopReason = "toolUse";
 			}
 		} else if (event.type === "error") {

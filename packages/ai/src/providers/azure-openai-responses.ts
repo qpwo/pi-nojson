@@ -12,8 +12,9 @@ import type {
 } from "../types.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
+import { contextWithTextToolProtocol, wrapTextToolStream } from "../utils/text-tools.ts";
 import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
-import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.ts";
+import { convertResponsesMessages, processResponsesStream } from "./openai-responses-shared.ts";
 import { buildBaseOptions } from "./simple-options.ts";
 
 const DEFAULT_AZURE_API_VERSION = "v1";
@@ -74,6 +75,9 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 	context: Context,
 	options?: AzureOpenAIResponsesOptions,
 ): AssistantMessageEventStream => {
+	const originalContext = context;
+	context = contextWithTextToolProtocol(context);
+
 	const stream = new AssistantMessageEventStream();
 
 	// Start async processing
@@ -144,7 +148,7 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 		}
 	})();
 
-	return stream;
+	return wrapTextToolStream(stream, originalContext);
 };
 
 export const streamSimpleAzureOpenAIResponses: StreamFunction<"azure-openai-responses", SimpleStreamOptions> = (
@@ -267,9 +271,7 @@ function buildParams(
 		params.temperature = options?.temperature;
 	}
 
-	if (context.tools && context.tools.length > 0) {
-		params.tools = convertResponsesTools(context.tools);
-	}
+	// tools disabled natively
 
 	if (model.reasoning) {
 		if (options?.reasoningEffort || options?.reasoningSummary) {

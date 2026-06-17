@@ -4,7 +4,6 @@ import type {
 	ChatCompletionStreamRequestMessage,
 	CompletionEvent,
 	ContentChunk,
-	FunctionTool,
 } from "@mistralai/mistralai/models/components";
 import { calculateCost, clampThinkingLevel } from "../models.ts";
 import type {
@@ -18,13 +17,16 @@ import type {
 	StreamOptions,
 	TextContent,
 	ThinkingContent,
-	Tool,
-	ToolCall,
 } from "../types.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
-import { parseStreamingJson } from "../utils/json-parse.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
+import {
+	contextWithTextToolProtocol,
+	formatToolResultText,
+	textToolCallForProvider,
+	wrapTextToolStream,
+} from "../utils/text-tools.ts";
 import { buildBaseOptions } from "./simple-options.ts";
 import { transformMessages } from "./transform-messages.ts";
 
@@ -50,6 +52,9 @@ export const streamMistral: StreamFunction<"mistral-conversations", MistralOptio
 	context: Context,
 	options?: MistralOptions,
 ): AssistantMessageEventStream => {
+	const originalContext = context;
+	context = contextWithTextToolProtocol(context);
+
 	const stream = new AssistantMessageEventStream();
 
 	(async () => {
@@ -101,7 +106,7 @@ export const streamMistral: StreamFunction<"mistral-conversations", MistralOptio
 		}
 	})();
 
-	return stream;
+	return wrapTextToolStream(stream, originalContext);
 };
 
 /**
@@ -249,10 +254,10 @@ function buildChatPayload(
 		messages: toChatMessages(messages, model.input.includes("image")),
 	};
 
-	if (context.tools?.length) payload.tools = toFunctionTools(context.tools);
+	// tools disabled natively
 	if (options?.temperature !== undefined) payload.temperature = options.temperature;
 	if (options?.maxTokens !== undefined) payload.maxTokens = options.maxTokens;
-	if (options?.toolChoice) payload.toolChoice = mapToolChoice(options.toolChoice);
+	// tools disabled natively
 	if (options?.promptMode) payload.promptMode = options.promptMode;
 	if (options?.reasoningEffort) payload.reasoningEffort = options.reasoningEffort;
 
@@ -275,7 +280,6 @@ async function consumeChatStream(
 	let currentBlock: TextContent | ThinkingContent | null = null;
 	const blocks = output.content;
 	const blockIndex = () => blocks.length - 1;
-	const toolBlocksByKey = new Map<string, number>();
 
 	const finishCurrentBlock = (block?: typeof currentBlock) => {
 		if (!block) return;
@@ -383,95 +387,20 @@ async function consumeChatStream(
 				}
 			}
 		}
-
-		const toolCalls = delta.toolCalls || [];
-		for (const toolCall of toolCalls) {
-			if (currentBlock) {
-				finishCurrentBlock(currentBlock);
-				currentBlock = null;
-			}
-			const callId =
-				toolCall.id && toolCall.id !== "null"
-					? toolCall.id
-					: deriveMistralToolCallId(`toolcall:${toolCall.index ?? 0}`, 0);
-			const key = `${callId}:${toolCall.index || 0}`;
-			const existingIndex = toolBlocksByKey.get(key);
-			let block: (ToolCall & { partialArgs?: string }) | undefined;
-
-			if (existingIndex !== undefined) {
-				const existing = output.content[existingIndex];
-				if (existing?.type === "toolCall") {
-					block = existing as ToolCall & { partialArgs?: string };
-				}
-			}
-
-			if (!block) {
-				block = {
-					type: "toolCall",
-					id: callId,
-					name: toolCall.function.name,
-					arguments: {},
-					partialArgs: "",
-				};
-				output.content.push(block);
-				toolBlocksByKey.set(key, output.content.length - 1);
-				stream.push({ type: "toolcall_start", contentIndex: output.content.length - 1, partial: output });
-			}
-
-			const argsDelta =
-				typeof toolCall.function.arguments === "string"
-					? toolCall.function.arguments
-					: JSON.stringify(toolCall.function.arguments || {});
-			block.partialArgs = (block.partialArgs || "") + argsDelta;
-			block.arguments = parseStreamingJson<Record<string, unknown>>(block.partialArgs);
-			stream.push({
-				type: "toolcall_delta",
-				contentIndex: toolBlocksByKey.get(key)!,
-				delta: argsDelta,
-				partial: output,
-			});
-		}
 	}
 
 	finishCurrentBlock(currentBlock);
-	for (const index of toolBlocksByKey.values()) {
-		const block = output.content[index];
-		if (block.type !== "toolCall") continue;
-		const toolBlock = block as ToolCall & { partialArgs?: string };
-		toolBlock.arguments = parseStreamingJson<Record<string, unknown>>(toolBlock.partialArgs);
-		// Finalize in-place and strip the scratch buffer so replay only
-		// carries parsed arguments.
-		delete toolBlock.partialArgs;
-		stream.push({
-			type: "toolcall_end",
-			contentIndex: index,
-			toolCall: toolBlock,
-			partial: output,
-		});
-	}
 }
 
-function toFunctionTools(tools: Tool[]): Array<FunctionTool & { type: "function" }> {
-	return tools.map((tool) => ({
-		type: "function",
-		function: {
-			name: tool.name,
-			description: tool.description,
-			parameters: stripSymbolKeys(tool.parameters) as Record<string, unknown>,
-			strict: false,
-		},
-	}));
-}
-
-function stripSymbolKeys(value: unknown): unknown {
+function _stripSymbolKeys(value: unknown): unknown {
 	if (Array.isArray(value)) {
-		return value.map((item) => stripSymbolKeys(item));
+		return value.map((item) => _stripSymbolKeys(item));
 	}
 
 	if (value && typeof value === "object") {
 		const result: Record<string, unknown> = {};
 		for (const [key, entry] of Object.entries(value)) {
-			result[key] = stripSymbolKeys(entry);
+			result[key] = _stripSymbolKeys(entry);
 		}
 		return result;
 	}
@@ -507,7 +436,6 @@ function toChatMessages(messages: Message[], supportsImages: boolean): ChatCompl
 
 		if (msg.role === "assistant") {
 			const contentParts: ContentChunk[] = [];
-			const toolCalls: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> = [];
 
 			for (const block of msg.content) {
 				if (block.type === "text") {
@@ -525,28 +453,26 @@ function toChatMessages(messages: Message[], supportsImages: boolean): ChatCompl
 					}
 					continue;
 				}
-				toolCalls.push({
-					id: block.id,
-					type: "function",
-					function: { name: block.name, arguments: JSON.stringify(block.arguments || {}) },
-				});
+				if (block.type === "toolCall") {
+					contentParts.push({
+						type: "text",
+						text: sanitizeSurrogates(textToolCallForProvider(block)),
+					});
+				}
 			}
 
 			const assistantMessage: ChatCompletionStreamRequestMessage = { role: "assistant" };
 			if (contentParts.length > 0) assistantMessage.content = contentParts;
-			if (toolCalls.length > 0) assistantMessage.toolCalls = toolCalls;
-			if (contentParts.length > 0 || toolCalls.length > 0) result.push(assistantMessage);
+			if (contentParts.length > 0) result.push(assistantMessage);
 			continue;
 		}
 
-		const toolContent: ContentChunk[] = [];
-		const textResult = msg.content
-			.filter((part) => part.type === "text")
-			.map((part) => (part.type === "text" ? sanitizeSurrogates(part.text) : ""))
-			.join("\n");
-		const hasImages = msg.content.some((part) => part.type === "image");
-		const toolText = buildToolResultText(textResult, hasImages, supportsImages, msg.isError);
-		toolContent.push({ type: "text", text: toolText });
+		const toolContent: ContentChunk[] = [
+			{
+				type: "text",
+				text: sanitizeSurrogates(formatToolResultText(msg)),
+			},
+		];
 		for (const part of msg.content) {
 			if (!supportsImages) continue;
 			if (part.type !== "image") continue;
@@ -555,18 +481,25 @@ function toChatMessages(messages: Message[], supportsImages: boolean): ChatCompl
 				imageUrl: `data:${part.mimeType};base64,${part.data}`,
 			});
 		}
-		result.push({
-			role: "tool",
-			toolCallId: msg.toolCallId,
-			name: msg.toolName,
-			content: toolContent,
-		});
+		const lastMessage = result[result.length - 1];
+		const canMergeWithLastToolResultUserMessage =
+			lastMessage?.role === "user" &&
+			Array.isArray(lastMessage.content) &&
+			lastMessage.content.some((part) => part.type === "text" && part.text.includes("<tool_results>"));
+		if (canMergeWithLastToolResultUserMessage && Array.isArray(lastMessage.content)) {
+			lastMessage.content.push(...toolContent);
+		} else {
+			result.push({
+				role: "user",
+				content: toolContent,
+			});
+		}
 	}
 
 	return result;
 }
 
-function buildToolResultText(text: string, hasImages: boolean, supportsImages: boolean, isError: boolean): string {
+function _buildToolResultText(text: string, hasImages: boolean, supportsImages: boolean, isError: boolean): string {
 	const trimmed = text.trim();
 	const errorPrefix = isError ? "[tool error] " : "";
 
@@ -602,7 +535,7 @@ function mapReasoningEffort(
 	return (model.thinkingLevelMap?.[level] ?? "high") as MistralReasoningEffort;
 }
 
-function mapToolChoice(
+function _mapToolChoice(
 	choice: MistralOptions["toolChoice"],
 ): "auto" | "none" | "any" | "required" | { type: "function"; function: { name: string } } | undefined {
 	if (!choice) return undefined;
@@ -623,8 +556,6 @@ function mapChatStopReason(reason: string | null): StopReason {
 		case "length":
 		case "model_length":
 			return "length";
-		case "tool_calls":
-			return "toolUse";
 		case "error":
 			return "error";
 		default:

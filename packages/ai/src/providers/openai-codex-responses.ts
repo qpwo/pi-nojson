@@ -1,6 +1,5 @@
 import type * as NodeOs from "node:os";
 import type {
-	Tool as OpenAITool,
 	ResponseCreateParamsStreaming,
 	ResponseInput,
 	ResponseStreamEvent,
@@ -40,8 +39,9 @@ import {
 } from "../utils/diagnostics.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
+import { contextWithTextToolProtocol, wrapTextToolStream } from "../utils/text-tools.ts";
 import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
-import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.ts";
+import { convertResponsesMessages, processResponsesStream } from "./openai-responses-shared.ts";
 import { buildBaseOptions } from "./simple-options.ts";
 
 // ============================================================================
@@ -89,9 +89,6 @@ interface RequestBody {
 	instructions?: string;
 	previous_response_id?: string;
 	input?: ResponseInput;
-	tools?: OpenAITool[];
-	tool_choice?: "auto";
-	parallel_tool_calls?: boolean;
 	temperature?: number;
 	reasoning?: { effort?: string; summary?: string };
 	service_tier?: ResponseCreateParamsStreaming["service_tier"];
@@ -198,6 +195,9 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 	context: Context,
 	options?: OpenAICodexResponsesOptions,
 ): AssistantMessageEventStream => {
+	const originalContext = context;
+	context = contextWithTextToolProtocol(context);
+
 	const stream = new AssistantMessageEventStream();
 
 	(async () => {
@@ -403,7 +403,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 		}
 	})();
 
-	return stream;
+	return wrapTextToolStream(stream, originalContext);
 };
 
 export const streamSimpleOpenAICodexResponses: StreamFunction<"openai-codex-responses", SimpleStreamOptions> = (
@@ -448,8 +448,6 @@ function buildRequestBody(
 		text: { verbosity: options?.textVerbosity || "low" },
 		include: ["reasoning.encrypted_content"],
 		prompt_cache_key: clampOpenAIPromptCacheKey(options?.sessionId),
-		tool_choice: "auto",
-		parallel_tool_calls: true,
 	};
 
 	if (options?.temperature !== undefined) {
@@ -458,10 +456,6 @@ function buildRequestBody(
 
 	if (options?.serviceTier !== undefined) {
 		body.service_tier = options.serviceTier;
-	}
-
-	if (context.tools && context.tools.length > 0) {
-		body.tools = convertResponsesTools(context.tools, { strict: null });
 	}
 
 	if (options?.reasoningEffort !== undefined) {
@@ -1360,7 +1354,7 @@ async function processWebSocketStream(
 		} else if (useCachedContext && entry && output.responseId) {
 			const responseItems = convertResponsesMessages(model, { messages: [output] }, CODEX_TOOL_CALL_PROVIDERS, {
 				includeSystemPrompt: false,
-			}).filter((item) => item.type !== "function_call_output");
+			});
 			entry.continuation = {
 				lastRequestBody: fullBody,
 				lastResponseId: output.responseId,

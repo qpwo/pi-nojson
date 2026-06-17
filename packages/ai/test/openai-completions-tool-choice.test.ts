@@ -105,10 +105,14 @@ describe("openai-completions tool_choice", () => {
 			} as unknown as Parameters<typeof streamSimple>[2],
 		).result();
 
-		const params = (payload ?? mockState.lastParams) as { tool_choice?: string; tools?: unknown[] };
-		expect(params.tool_choice).toBe("required");
-		expect(Array.isArray(params.tools)).toBe(true);
-		expect(params.tools?.length ?? 0).toBeGreaterThan(0);
+		const params = (payload ?? mockState.lastParams) as {
+			tool_choice?: string;
+			tools?: unknown[];
+			messages?: unknown[];
+		};
+		expect(params.tool_choice).toBeUndefined();
+		expect("tools" in (params as object)).toBe(false);
+		expect(JSON.stringify(params.messages)).toContain("Enabled tool names: ping");
 	});
 
 	it("omits strict when compat disables strict mode", async () => {
@@ -149,11 +153,10 @@ describe("openai-completions tool_choice", () => {
 			} as unknown as Parameters<typeof streamSimple>[2],
 		).result();
 
-		const params = (payload ?? mockState.lastParams) as { tools?: Array<{ function?: Record<string, unknown> }> };
-		const tool = params.tools?.[0]?.function;
-		expect(tool).toBeTruthy();
-		expect(tool?.strict).toBeUndefined();
-		expect("strict" in (tool ?? {})).toBe(false);
+		const params = (payload ?? mockState.lastParams) as { tools?: unknown[]; messages?: unknown[] };
+		expect("tools" in (params as object)).toBe(false);
+		expect(JSON.stringify(params.messages)).toContain("Enabled tool names: ping");
+		expect(JSON.stringify(params.messages)).toContain("ok");
 	});
 
 	it("maps groq qwen3 reasoning levels to default reasoning_effort", async () => {
@@ -212,130 +215,41 @@ describe("openai-completions tool_choice", () => {
 		expect(params.reasoning_effort).toBe("medium");
 	});
 
-	it("enables tool_stream for supported z.ai models with tools", async () => {
-		const model = getModel("zai", "glm-5.1")!;
+	it("does not emit native z.ai tool_stream even for z.ai models with tools", async () => {
 		const tools: Tool[] = [
 			{
-				name: "ping",
-				description: "Ping tool",
+				name: "read",
+				description: "Read files",
 				parameters: Type.Object({
-					ok: Type.Boolean(),
+					path: Type.String(),
 				}),
 			},
 		];
 		let payload: unknown;
+		const model = getModel("zai", "glm-4.7")!;
 
 		await streamSimple(
 			model,
 			{
-				messages: [
-					{
-						role: "user",
-						content: "Call ping with ok=true",
-						timestamp: Date.now(),
-					},
-				],
+				messages: [{ role: "user", content: "Read package.json", timestamp: Date.now() }],
 				tools,
 			},
 			{
 				apiKey: "test",
-				onPayload: (params: unknown) => {
+				onPayload: (params) => {
 					payload = params;
 				},
 			},
 		).result();
 
-		const params = (payload ?? mockState.lastParams) as { tool_stream?: boolean };
-		expect(params.tool_stream).toBe(true);
-	});
-
-	it("stores z.ai tool_stream support in model compat metadata", () => {
-		expect(getModel("zai", "glm-5.1")?.compat?.zaiToolStream).toBe(true);
-		expect(getModel("zai", "glm-4.7")?.compat?.zaiToolStream).toBe(true);
-		expect(getModel("zai", "glm-4.7")?.compat?.zaiToolStream).toBe(true);
-		expect(getModel("zai", "glm-5-turbo")?.compat?.zaiToolStream).toBe(true);
-		expect(getModel("zai", "glm-4.5-air")?.compat?.zaiToolStream).toBeUndefined();
-	});
-
-	it("omits tool_stream for unsupported z.ai models", async () => {
-		const model = getModel("zai", "glm-4.5-air")!;
-		const tools: Tool[] = [
-			{
-				name: "ping",
-				description: "Ping tool",
-				parameters: Type.Object({
-					ok: Type.Boolean(),
-				}),
-			},
-		];
-		let payload: unknown;
-
-		await streamSimple(
-			model,
-			{
-				messages: [
-					{
-						role: "user",
-						content: "Call ping with ok=true",
-						timestamp: Date.now(),
-					},
-				],
-				tools,
-			},
-			{
-				apiKey: "test",
-				onPayload: (params: unknown) => {
-					payload = params;
-				},
-			},
-		).result();
-
-		const params = (payload ?? mockState.lastParams) as { tool_stream?: boolean };
+		const params = (payload ?? mockState.lastParams) as {
+			tool_stream?: boolean;
+			tools?: unknown[];
+			messages?: unknown[];
+		};
 		expect(params.tool_stream).toBeUndefined();
-	});
-
-	it("respects explicit z.ai tool_stream compat override", async () => {
-		const baseModel = getModel("zai", "glm-4.5-air")!;
-		const model = {
-			...baseModel,
-			compat: {
-				...baseModel.compat,
-				zaiToolStream: true,
-			},
-		} as const;
-		const tools: Tool[] = [
-			{
-				name: "ping",
-				description: "Ping tool",
-				parameters: Type.Object({
-					ok: Type.Boolean(),
-				}),
-			},
-		];
-		let payload: unknown;
-
-		await streamSimple(
-			model,
-			{
-				messages: [
-					{
-						role: "user",
-						content: "Call ping with ok=true",
-						timestamp: Date.now(),
-					},
-				],
-				tools,
-			},
-			{
-				apiKey: "test",
-				onPayload: (params: unknown) => {
-					payload = params;
-				},
-			},
-		).result();
-
-		const params = (payload ?? mockState.lastParams) as { tool_stream?: boolean };
-		expect(params.tool_stream).toBe(true);
+		expect(params.tools).toBeUndefined();
+		expect(JSON.stringify(params.messages)).toContain("Provider-native JSON/function tools are disabled");
 	});
 
 	it("omits tool_stream when no tools are provided", async () => {
@@ -474,59 +388,23 @@ describe("openai-completions tool_choice", () => {
 		expect(response.errorMessage).toBe("Stream ended without finish_reason");
 	});
 
-	it("coalesces tool call deltas by stable index when provider mutates ids mid-stream", async () => {
+	it("parses streamed text tool blocks into tool calls", async () => {
 		mockState.chunks = [
 			{
-				id: "chatcmpl-kimi-bad-stream",
+				id: "chatcmpl-text-tool",
 				choices: [
 					{
-						delta: {
-							tool_calls: [
-								{
-									index: 0,
-									id: "functions.read:0",
-									type: "function",
-									function: { name: "read", arguments: "" },
-								},
-							],
-						},
+						delta: { content: '<read path="README' },
 						finish_reason: null,
 					},
 				],
 			},
 			{
-				id: "chatcmpl-kimi-bad-stream",
+				id: "chatcmpl-text-tool",
 				choices: [
 					{
-						delta: {
-							tool_calls: [
-								{
-									index: 0,
-									id: "chatcmpl-tool-a",
-									type: "function",
-									function: { name: null, arguments: '{"path":"README' },
-								},
-							],
-						},
-						finish_reason: null,
-					},
-				],
-			},
-			{
-				id: "chatcmpl-kimi-bad-stream",
-				choices: [
-					{
-						delta: {
-							tool_calls: [
-								{
-									index: 0,
-									id: "chatcmpl-tool-b",
-									type: "function",
-									function: { name: null, arguments: '.md"}' },
-								},
-							],
-						},
-						finish_reason: "tool_calls",
+						delta: { content: '.md"></read>' },
+						finish_reason: "stop",
 					},
 				],
 				usage: {
@@ -571,109 +449,53 @@ describe("openai-completions tool_choice", () => {
 
 		const response = await s.result();
 		expect(response.stopReason).toBe("toolUse");
-		expect(toolCallContentIndexes).toEqual([0, 0, 0, 0, 0]);
+		expect(toolCallContentIndexes).toEqual([0, 0, 0]);
 		expect(response.content).toHaveLength(1);
 		const toolCall = response.content[0];
 		expect(toolCall.type).toBe("toolCall");
 		if (toolCall.type !== "toolCall") {
 			throw new Error("Expected toolCall content");
 		}
-		expect(toolCall.id).toBe("functions.read:0");
 		expect(toolCall.name).toBe("read");
 		expect(toolCall.arguments).toEqual({ path: "README.md" });
 		expect(toolCall).not.toHaveProperty("streamIndex");
 		expect(toolCall).not.toHaveProperty("partialArgs");
 	});
 
-	it("accumulates mixed content, reasoning, and parallel tool call deltas independently", async () => {
+	it("accumulates mixed content, reasoning, and parallel text tool blocks independently", async () => {
 		mockState.chunks = [
 			{
-				id: "chatcmpl-mixed-deltas",
+				id: "chatcmpl-mixed-text-tools",
 				choices: [
 					{
 						delta: {
-							content: "answer 1",
+							content: 'answer 1 <read path="README',
 							reasoning_content: "think 1",
-							tool_calls: [
-								{
-									index: 0,
-									id: "tc_read_initial",
-									type: "function",
-									function: { name: "read", arguments: '{"path":"README' },
-								},
-								{
-									index: 1,
-									id: "tc_grep_initial",
-									type: "function",
-									function: { name: "grep", arguments: '{"pattern":"TODO' },
-								},
-								{
-									id: "tc_list_no_index",
-									type: "function",
-									function: { name: "list", arguments: '{"path":"packages' },
-								},
-								{
-									id: "tc_write_no_index",
-									type: "function",
-									function: { name: "write", arguments: '{"path":"out' },
-								},
-							],
 						},
 						finish_reason: null,
 					},
 				],
 			},
 			{
-				id: "chatcmpl-mixed-deltas",
+				id: "chatcmpl-mixed-text-tools",
 				choices: [
 					{
 						delta: {
-							content: " answer 2",
-							tool_calls: [
-								{
-									index: 1,
-									id: "tc_grep_changed",
-									type: "function",
-									function: { arguments: '","path":"src' },
-								},
-								{
-									id: "tc_write_no_index",
-									type: "function",
-									function: { arguments: '.txt","content":"ok"}' },
-								},
-								{
-									id: "tc_list_no_index",
-									type: "function",
-									function: { arguments: '/ai"}' },
-								},
-							],
+							content: '.md"></read> <grep pattern="TODO" path="src"></grep>',
 						},
 						finish_reason: null,
 					},
 				],
 			},
 			{
-				id: "chatcmpl-mixed-deltas",
+				id: "chatcmpl-mixed-text-tools",
 				choices: [
 					{
 						delta: {
-							content: "\n",
+							content: '\n<ls path="packages/ai"></ls>\n' + '<write path="out.txt">\nok\n</write>',
 							reasoning_content: " think 2",
-							tool_calls: [
-								{
-									index: 0,
-									id: "tc_read_changed",
-									type: "function",
-									function: { arguments: '.md"}' },
-								},
-								{
-									index: 1,
-									type: "function",
-									function: { arguments: '"}' },
-								},
-							],
 						},
-						finish_reason: "tool_calls",
+						finish_reason: "stop",
 					},
 				],
 				usage: {
@@ -699,7 +521,7 @@ describe("openai-completions tool_choice", () => {
 				parameters: Type.Object({ pattern: Type.String(), path: Type.String() }),
 			},
 			{
-				name: "list",
+				name: "ls",
 				description: "List a directory",
 				parameters: Type.Object({ path: Type.String() }),
 			},
@@ -744,77 +566,30 @@ describe("openai-completions tool_choice", () => {
 		expect(eventTypes.filter((type) => type === "thinking_delta")).toHaveLength(2);
 		expect(eventTypes.filter((type) => type === "thinking_end")).toHaveLength(1);
 		expect(eventTypes.filter((type) => type === "toolcall_start")).toHaveLength(4);
-		expect(eventTypes.filter((type) => type === "toolcall_delta")).toHaveLength(9);
+		expect(eventTypes.filter((type) => type === "toolcall_delta")).toHaveLength(4);
 		expect(eventTypes.filter((type) => type === "toolcall_end")).toHaveLength(4);
-		expect(toolEventsByContentIndex.get(2)).toEqual([
-			"toolcall_start",
-			"toolcall_delta",
-			"toolcall_delta",
-			"toolcall_end",
-		]);
-		expect(toolEventsByContentIndex.get(3)).toEqual([
-			"toolcall_start",
-			"toolcall_delta",
-			"toolcall_delta",
-			"toolcall_delta",
-			"toolcall_end",
-		]);
-		expect(toolEventsByContentIndex.get(4)).toEqual([
-			"toolcall_start",
-			"toolcall_delta",
-			"toolcall_delta",
-			"toolcall_end",
-		]);
-		expect(toolEventsByContentIndex.get(5)).toEqual([
-			"toolcall_start",
-			"toolcall_delta",
-			"toolcall_delta",
-			"toolcall_end",
-		]);
+		expect(toolEventsByContentIndex.get(2)).toEqual(["toolcall_start", "toolcall_delta", "toolcall_end"]);
+		expect(toolEventsByContentIndex.get(3)).toEqual(["toolcall_start", "toolcall_delta", "toolcall_end"]);
+		expect(toolEventsByContentIndex.get(4)).toEqual(["toolcall_start", "toolcall_delta", "toolcall_end"]);
+		expect(toolEventsByContentIndex.get(5)).toEqual(["toolcall_start", "toolcall_delta", "toolcall_end"]);
 
 		expect(response.content).toHaveLength(6);
-		expect(response.content[0]).toEqual({ type: "text", text: "answer 1 answer 2\n" });
-		expect(response.content[1]).toEqual({
-			type: "thinking",
-			thinking: "think 1 think 2",
-			thinkingSignature: "reasoning_content",
+		expect(response.content[0]).toMatchObject({ type: "text" });
+		if (response.content[0].type !== "text") throw new Error("Expected text content");
+		expect(response.content[0].text.trim()).toBe("answer 1");
+		expect(response.content[1]).toMatchObject({ type: "thinking", thinking: "think 1 think 2" });
+		expect(response.content[2]).toMatchObject({ type: "toolCall", name: "read", arguments: { path: "README.md" } });
+		expect(response.content[3]).toMatchObject({
+			type: "toolCall",
+			name: "grep",
+			arguments: { pattern: "TODO", path: "src" },
 		});
-		const readCall = response.content[2];
-		const grepCall = response.content[3];
-		const listCall = response.content[4];
-		const writeCall = response.content[5];
-		expect(readCall.type).toBe("toolCall");
-		expect(grepCall.type).toBe("toolCall");
-		expect(listCall.type).toBe("toolCall");
-		expect(writeCall.type).toBe("toolCall");
-		if (
-			readCall.type !== "toolCall" ||
-			grepCall.type !== "toolCall" ||
-			listCall.type !== "toolCall" ||
-			writeCall.type !== "toolCall"
-		) {
-			throw new Error("Expected toolCall content");
-		}
-		expect(readCall.id).toBe("tc_read_initial");
-		expect(readCall.name).toBe("read");
-		expect(readCall.arguments).toEqual({ path: "README.md" });
-		expect(readCall).not.toHaveProperty("streamIndex");
-		expect(readCall).not.toHaveProperty("partialArgs");
-		expect(grepCall.id).toBe("tc_grep_initial");
-		expect(grepCall.name).toBe("grep");
-		expect(grepCall.arguments).toEqual({ pattern: "TODO", path: "src" });
-		expect(grepCall).not.toHaveProperty("streamIndex");
-		expect(grepCall).not.toHaveProperty("partialArgs");
-		expect(listCall.id).toBe("tc_list_no_index");
-		expect(listCall.name).toBe("list");
-		expect(listCall.arguments).toEqual({ path: "packages/ai" });
-		expect(listCall).not.toHaveProperty("streamIndex");
-		expect(listCall).not.toHaveProperty("partialArgs");
-		expect(writeCall.id).toBe("tc_write_no_index");
-		expect(writeCall.name).toBe("write");
-		expect(writeCall.arguments).toEqual({ path: "out.txt", content: "ok" });
-		expect(writeCall).not.toHaveProperty("streamIndex");
-		expect(writeCall).not.toHaveProperty("partialArgs");
+		expect(response.content[4]).toMatchObject({ type: "toolCall", name: "ls", arguments: { path: "packages/ai" } });
+		expect(response.content[5]).toMatchObject({
+			type: "toolCall",
+			name: "write",
+			arguments: { path: "out.txt", content: "ok" },
+		});
 	});
 
 	it("uses system messages for non-OpenAI/Anthropic OpenRouter reasoning model instructions", async () => {

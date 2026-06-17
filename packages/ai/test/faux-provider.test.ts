@@ -10,6 +10,7 @@ import {
 	Type,
 } from "../src/index.ts";
 import type { AssistantMessageEvent, Context } from "../src/types.ts";
+import { contextWithTextToolProtocol } from "../src/utils/text-tools.ts";
 
 async function collectEvents(streamResult: ReturnType<typeof stream>): Promise<AssistantMessageEvent[]> {
 	const events: AssistantMessageEvent[] = [];
@@ -228,12 +229,12 @@ describe("faux provider", () => {
 		};
 
 		const response = await complete(registration.getModel(), context);
+		const transformedContext = contextWithTextToolProtocol(context);
 		const promptText = [
-			"system:sys",
+			`system:${transformedContext.systemPrompt}`,
 			"user:hello\n[image:image/png:4]",
 			"assistant:prior",
 			"toolResult:echo\ntool out",
-			`tools:${JSON.stringify([tool])}`,
 		].join("\n\n");
 		const expectedPromptTokens = Math.ceil(promptText.length / 4);
 		const expectedOutputTokens = Math.ceil("done".length / 4);

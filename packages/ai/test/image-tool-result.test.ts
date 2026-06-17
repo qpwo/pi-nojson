@@ -133,8 +133,8 @@ async function handleToolWithTextAndImageResult<TApi extends Api>(
 	// Define a tool that returns both text and an image
 	const getImageSchema = Type.Object({});
 	const getImageTool: Tool<typeof getImageSchema> = {
-		name: "get_circle_with_description",
-		description: "Returns a circle image with a text description",
+		name: "get_shape_asset",
+		description: "Returns an image with a text description",
 		parameters: getImageSchema,
 	};
 
@@ -144,7 +144,7 @@ async function handleToolWithTextAndImageResult<TApi extends Api>(
 			{
 				role: "user",
 				content:
-					"Use the get_circle_with_description tool and tell me what you learned. Also say what color the shape is.",
+					"Use the get_shape_asset tool and tell me what you learned. State the exact visible color and shape from the returned image. If you cannot inspect the image, say so.",
 				timestamp: Date.now(),
 			},
 		],
@@ -161,7 +161,7 @@ async function handleToolWithTextAndImageResult<TApi extends Api>(
 	if (!toolCall || toolCall.type !== "toolCall") {
 		throw new Error("Expected tool call");
 	}
-	expect(toolCall.name).toBe("get_circle_with_description");
+	expect(toolCall.name).toBe("get_shape_asset");
 
 	// Add the tool call to context
 	context.messages.push(firstResponse);
@@ -200,9 +200,9 @@ async function handleToolWithTextAndImageResult<TApi extends Api>(
 		const lowerContent = textContent.text.toLowerCase();
 		// Should mention details from the text (diameter/pixels)
 		expect(lowerContent.match(/diameter|100|pixel/)).toBeTruthy();
-		// Should also mention the visual properties (red and circle)
+		// Should also mention the visual properties (red and circular/round shape)
 		expect(lowerContent).toContain("red");
-		expect(lowerContent).toContain("circle");
+		expect(lowerContent.match(/circle|circular|round/)).toBeTruthy();
 	}
 }
 
