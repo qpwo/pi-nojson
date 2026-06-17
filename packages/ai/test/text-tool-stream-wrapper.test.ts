@@ -37,6 +37,21 @@ function tag(name: string, body = "", attrs = ""): string {
 	return `${lt}${name}${attrs}${gt}${body}${lt}/${name}${gt}`;
 }
 
+function visibleQuote(body: string): string {
+	let out = "";
+	let lineStart = 0;
+	while (lineStart <= body.length) {
+		out += "    ";
+		let lineEnd = lineStart;
+		while (lineEnd < body.length && body[lineEnd] !== "\n" && body[lineEnd] !== "\r") lineEnd++;
+		out += body.slice(lineStart, lineEnd);
+		if (lineEnd >= body.length) break;
+		out += "\n";
+		lineStart = lineEnd + (body[lineEnd] === "\r" && body[lineEnd + 1] === "\n" ? 2 : 1);
+	}
+	return `[quote]\n${out}\n[/quote]`;
+}
+
 describe("text tool stream wrapper", () => {
 	it("turns final plain-text tool blocks into tool-call events and message blocks", async () => {
 		const raw = new AssistantMessageEventStream();
@@ -178,7 +193,7 @@ describe("text tool stream wrapper", () => {
 		if (done?.type !== "done") throw new Error("expected done");
 		expect(done.reason).toBe("stop");
 		expect(done.message.stopReason).toBe("stop");
-		expect(done.message.content).toEqual([{ type: "text", text: quotedText }]);
+		expect(done.message.content).toEqual([{ type: "text", text: visibleQuote(quotedText) }]);
 	});
 
 	it("treats quoted tool_code blocks as inert text", async () => {
@@ -209,7 +224,7 @@ describe("text tool stream wrapper", () => {
 		expect(done?.type).toBe("done");
 		if (done?.type !== "done") throw new Error("expected done");
 		expect(done.reason).toBe("stop");
-		expect(done.message.content).toEqual([{ type: "text", text: quotedText }]);
+		expect(done.message.content).toEqual([{ type: "text", text: visibleQuote(quotedText) }]);
 	});
 
 	it("treats backtick code spans as inert text even when they contain tool tags", async () => {

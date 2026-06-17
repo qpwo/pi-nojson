@@ -117,7 +117,7 @@ export function wrapTextToolStream(
 				}
 
 				attachTextToolCalls(context, event.message);
-				const unwrappedQuoteText = unwrapAssistantQuoteBlocks(event.message);
+				const renderedQuoteText = renderAssistantQuoteBlocks(event.message);
 				const doneEvent = {
 					...event,
 					reason: event.message.stopReason === "toolUse" ? "toolUse" : event.reason,
@@ -126,7 +126,7 @@ export function wrapTextToolStream(
 				if (
 					bufferProviderText &&
 					!sawNativeToolEvent &&
-					(event.message.stopReason === "toolUse" || unwrappedQuoteText)
+					(event.message.stopReason === "toolUse" || renderedQuoteText)
 				) {
 					pushSyntheticAssistantContentEvents(wrappedStream, event.message);
 				} else {
@@ -267,11 +267,11 @@ function isToolEvent(event: AssistantMessageEvent): boolean {
 	return event.type === "toolcall_start" || event.type === "toolcall_delta" || event.type === "toolcall_end";
 }
 
-function unwrapAssistantQuoteBlocks(message: AssistantMessage): boolean {
+function renderAssistantQuoteBlocks(message: AssistantMessage): boolean {
 	let changed = false;
 	for (const block of message.content) {
 		if (block.type !== "text") continue;
-		const text = unwrapQuoteBlocks(block.text);
+		const text = renderQuoteBlocks(block.text);
 		if (text === block.text) continue;
 		block.text = text;
 		changed = true;
@@ -279,7 +279,7 @@ function unwrapAssistantQuoteBlocks(message: AssistantMessage): boolean {
 	return changed;
 }
 
-function unwrapQuoteBlocks(text: string): string {
+function renderQuoteBlocks(text: string): string {
 	let out = "";
 	let index = 0;
 	while (index < text.length) {
@@ -296,8 +296,27 @@ function unwrapQuoteBlocks(text: string): string {
 		}
 
 		out += text.slice(index, start);
-		out += unwrapQuoteBlocks(text.slice(block.bodyStart, block.closeStart));
+		out += quoteDisplayText(renderQuoteBlocks(text.slice(block.bodyStart, block.closeStart)));
 		index = block.end;
+	}
+	return out;
+}
+
+function quoteDisplayText(body: string): string {
+	return `[quote]\n${indentQuoteBody(body)}\n[/quote]`;
+}
+
+function indentQuoteBody(body: string): string {
+	let out = "";
+	let lineStart = 0;
+	while (lineStart <= body.length) {
+		out += "    ";
+		let lineEnd = lineStart;
+		while (lineEnd < body.length && body[lineEnd] !== "\n" && body[lineEnd] !== "\r") lineEnd++;
+		out += body.slice(lineStart, lineEnd);
+		if (lineEnd >= body.length) break;
+		out += "\n";
+		lineStart = lineEnd + (body[lineEnd] === "\r" && body[lineEnd + 1] === "\n" ? 2 : 1);
 	}
 	return out;
 }
