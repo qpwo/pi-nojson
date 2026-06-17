@@ -1239,6 +1239,7 @@ export class Editor implements Component, Focusable {
 	private submitValue(): void {
 		this.cancelAutocomplete();
 		const result = this.expandPasteMarkers(this.state.lines.join("\n")).trim();
+		this.addToHistory(result);
 
 		this.state = { lines: [""], cursorLine: 0, cursorCol: 0 };
 		this.pastes.clear();

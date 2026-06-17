@@ -59,6 +59,23 @@ describe("Editor component", () => {
 			assert.strictEqual(editor.getText(), "second prompt");
 		});
 
+		it("adds submitted prompts to history automatically", () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			let submitted = "";
+
+			editor.onSubmit = (text) => {
+				submitted = text;
+			};
+			editor.setText("first prompt");
+			editor.handleInput("\r");
+
+			assert.strictEqual(submitted, "first prompt");
+			assert.strictEqual(editor.getText(), "");
+
+			editor.handleInput("\x1b[A"); // Up arrow
+			assert.strictEqual(editor.getText(), "first prompt");
+		});
+
 		it("cycles through history entries on repeated Up arrow", () => {
 			const editor = new Editor(createTestTUI(), defaultEditorTheme);
 
