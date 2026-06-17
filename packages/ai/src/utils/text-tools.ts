@@ -89,6 +89,8 @@ export function wrapTextToolStream(
 	context: Context,
 ): AssistantMessageEventStream {
 	const wrappedStream = new AssistantMessageEventStream();
+	const bufferProviderText = !!context.tools?.length;
+	const bufferedEvents: AssistantMessageEvent[] = [];
 	let sawNativeToolEvent = false;
 	let closed = false;
 
@@ -105,17 +107,27 @@ export function wrapTextToolStream(
 				}
 
 				if (event.type !== "done") {
-					wrappedStream.push(event);
+					if (bufferProviderText) bufferedEvents.push(event);
+					else wrappedStream.push(event);
 					continue;
 				}
 
 				attachTextToolCalls(context, event.message);
-				if (!sawNativeToolEvent) pushSyntheticTextToolEvents(wrappedStream, event.message);
-
-				wrappedStream.push({
+				const doneEvent = {
 					...event,
 					reason: event.message.stopReason === "toolUse" ? "toolUse" : event.reason,
-				});
+				};
+
+				if (bufferProviderText && !sawNativeToolEvent && event.message.stopReason === "toolUse") {
+					pushSyntheticAssistantContentEvents(wrappedStream, event.message);
+				} else {
+					for (const bufferedEvent of bufferedEvents) {
+						wrappedStream.push(bufferedEvent);
+					}
+					if (!sawNativeToolEvent) pushSyntheticTextToolEvents(wrappedStream, event.message);
+				}
+
+				wrappedStream.push(doneEvent);
 				wrappedStream.end();
 				closed = true;
 				return;
@@ -244,6 +256,38 @@ function formatTextToolSpec(tool: TextToolSpec): string {
 
 function isToolEvent(event: AssistantMessageEvent): boolean {
 	return event.type === "toolcall_start" || event.type === "toolcall_delta" || event.type === "toolcall_end";
+}
+
+function pushSyntheticAssistantContentEvents(stream: AssistantMessageEventStream, message: AssistantMessage): void {
+	const content: AssistantMessage["content"] = [];
+	stream.push({ type: "start", partial: assistantWithContent(message, content) });
+	for (const block of message.content) {
+		const contentIndex = content.length;
+		content.push(block);
+		const partial = assistantWithContent(message, content);
+		if (block.type === "text") {
+			stream.push({ type: "text_start", contentIndex, partial });
+			if (block.text) stream.push({ type: "text_delta", contentIndex, delta: block.text, partial });
+			stream.push({ type: "text_end", contentIndex, content: block.text, partial });
+		} else if (block.type === "thinking") {
+			stream.push({ type: "thinking_start", contentIndex, partial });
+			if (block.thinking) stream.push({ type: "thinking_delta", contentIndex, delta: block.thinking, partial });
+			stream.push({ type: "thinking_end", contentIndex, content: block.thinking, partial });
+		} else if (block.type === "toolCall") {
+			stream.push({ type: "toolcall_start", contentIndex, partial });
+			stream.push({
+				type: "toolcall_delta",
+				contentIndex,
+				delta: JSON.stringify(block.arguments ?? {}),
+				partial,
+			});
+			stream.push({ type: "toolcall_end", contentIndex, toolCall: block, partial });
+		}
+	}
+}
+
+function assistantWithContent(message: AssistantMessage, content: AssistantMessage["content"]): AssistantMessage {
+	return { ...message, content: content.slice() };
 }
 
 function pushSyntheticTextToolEvents(stream: AssistantMessageEventStream, message: AssistantMessage): void {

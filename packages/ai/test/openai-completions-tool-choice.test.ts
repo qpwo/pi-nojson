@@ -560,10 +560,10 @@ describe("openai-completions tool_choice", () => {
 		const response = await s.result();
 		expect(response.stopReason).toBe("toolUse");
 		expect(eventTypes.filter((type) => type === "text_start")).toHaveLength(1);
-		expect(eventTypes.filter((type) => type === "text_delta")).toHaveLength(3);
+		expect(eventTypes.filter((type) => type === "text_delta")).toHaveLength(1);
 		expect(eventTypes.filter((type) => type === "text_end")).toHaveLength(1);
 		expect(eventTypes.filter((type) => type === "thinking_start")).toHaveLength(1);
-		expect(eventTypes.filter((type) => type === "thinking_delta")).toHaveLength(2);
+		expect(eventTypes.filter((type) => type === "thinking_delta")).toHaveLength(1);
 		expect(eventTypes.filter((type) => type === "thinking_end")).toHaveLength(1);
 		expect(eventTypes.filter((type) => type === "toolcall_start")).toHaveLength(4);
 		expect(eventTypes.filter((type) => type === "toolcall_delta")).toHaveLength(4);
