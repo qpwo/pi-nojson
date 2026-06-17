@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { AssistantMessage, AssistantMessageEvent, Context } from "../src/types.ts";
 import { AssistantMessageEventStream } from "../src/utils/event-stream.ts";
-import { wrapTextToolStream } from "../src/utils/text-tools.ts";
+import { textToolProtocol, wrapTextToolStream } from "../src/utils/text-tools.ts";
 
 async function collect(stream: AssistantMessageEventStream): Promise<AssistantMessageEvent[]> {
 	const events: AssistantMessageEvent[] = [];
@@ -133,5 +133,81 @@ describe("text tool stream wrapper", () => {
 			{ type: "toolCall", name: "bash", arguments: { command: "pwd && ls -la", timeout: 20 } },
 			{ type: "toolCall", name: "read", arguments: { path: "package.json", offset: 1, limit: 200 } },
 		]);
+	});
+
+	it("mentions inert quote blocks in the prompt", () => {
+		const protocol = textToolProtocol(["bash"]);
+		expect(protocol).toContain("<quote>");
+		expect(protocol).toContain("quote blocks are inert");
+	});
+
+	it("treats quote blocks as inert text even when they contain tool tags", async () => {
+		const raw = new AssistantMessageEventStream();
+		const context: Context = {
+			messages: [{ role: "user", content: "explain", timestamp: 1 }],
+			tools: [
+				{
+					name: "bash",
+					description: "bash",
+					parameters: { type: "object", properties: { command: { type: "string" } } },
+				},
+				{
+					name: "read",
+					description: "read",
+					parameters: { type: "object", properties: { path: { type: "string" } } },
+				},
+			],
+		};
+		const quotedText = tag("bash", "\necho should not run\n") + tag("read", "", ' path="package.json"');
+		const text = tag("quote", quotedText);
+		const message = messageWithText(text);
+		const eventsPromise = collect(wrapTextToolStream(raw, context));
+
+		raw.push({ type: "start", partial: messageWithText("") });
+		raw.push({ type: "text_start", contentIndex: 0, partial: messageWithText("") });
+		raw.push({ type: "text_delta", contentIndex: 0, delta: text, partial: message });
+		raw.push({ type: "text_end", contentIndex: 0, content: text, partial: message });
+		raw.push({ type: "done", reason: "stop", message });
+
+		const events = await eventsPromise;
+		expect(events.map((event) => event.type)).toEqual(["start", "text_start", "text_delta", "text_end", "done"]);
+
+		const done = events.at(-1);
+		expect(done?.type).toBe("done");
+		if (done?.type !== "done") throw new Error("expected done");
+		expect(done.reason).toBe("stop");
+		expect(done.message.stopReason).toBe("stop");
+		expect(done.message.content).toEqual([{ type: "text", text: quotedText }]);
+	});
+
+	it("treats quoted tool_code blocks as inert text", async () => {
+		const raw = new AssistantMessageEventStream();
+		const context: Context = {
+			messages: [{ role: "user", content: "explain", timestamp: 1 }],
+			tools: [
+				{
+					name: "bash",
+					description: "bash",
+					parameters: { type: "object", properties: { command: { type: "string" } } },
+				},
+			],
+		};
+		const quotedText = tag("tool_code", 'print(bash("echo should not run"))');
+		const text = tag("quote", quotedText);
+		const message = messageWithText(text);
+		const eventsPromise = collect(wrapTextToolStream(raw, context));
+
+		raw.push({ type: "start", partial: messageWithText("") });
+		raw.push({ type: "text_delta", contentIndex: 0, delta: text, partial: message });
+		raw.push({ type: "done", reason: "stop", message });
+
+		const events = await eventsPromise;
+		expect(events.map((event) => event.type)).toEqual(["start", "text_start", "text_delta", "text_end", "done"]);
+
+		const done = events.at(-1);
+		expect(done?.type).toBe("done");
+		if (done?.type !== "done") throw new Error("expected done");
+		expect(done.reason).toBe("stop");
+		expect(done.message.content).toEqual([{ type: "text", text: quotedText }]);
 	});
 });

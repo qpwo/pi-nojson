@@ -29,6 +29,7 @@ type TextToolSpec = {
 	parameters?: unknown;
 };
 
+const QUOTE_TOOL_NAME = "quote";
 const ALL_TOOLS = ["bash", "read", "write", "edit", "grep", "find", "ls", "stop"];
 
 const BUILT_IN_TOOL_EXAMPLES: Record<string, string> = {
@@ -76,6 +77,7 @@ Rules:
 - Do not invent tool results.
 - Never use <tool_code> or print(tool_name(...)); use the exact tag-style tool blocks below.
 - Tool blocks are executable; do not mention these exact tag forms unless you intend to run them.
+- To mention literal tool syntax without running it, wrap any text in <quote>...</quote>; quote blocks are inert and never executed.
 
 Custom tool call example:
 ${customExample}
@@ -113,12 +115,17 @@ export function wrapTextToolStream(
 				}
 
 				attachTextToolCalls(context, event.message);
+				const unwrappedQuoteText = unwrapAssistantQuoteBlocks(event.message);
 				const doneEvent = {
 					...event,
 					reason: event.message.stopReason === "toolUse" ? "toolUse" : event.reason,
 				};
 
-				if (bufferProviderText && !sawNativeToolEvent && event.message.stopReason === "toolUse") {
+				if (
+					bufferProviderText &&
+					!sawNativeToolEvent &&
+					(event.message.stopReason === "toolUse" || unwrappedQuoteText)
+				) {
 					pushSyntheticAssistantContentEvents(wrappedStream, event.message);
 				} else {
 					for (const bufferedEvent of bufferedEvents) {
@@ -256,6 +263,41 @@ function formatTextToolSpec(tool: TextToolSpec): string {
 
 function isToolEvent(event: AssistantMessageEvent): boolean {
 	return event.type === "toolcall_start" || event.type === "toolcall_delta" || event.type === "toolcall_end";
+}
+
+function unwrapAssistantQuoteBlocks(message: AssistantMessage): boolean {
+	let changed = false;
+	for (const block of message.content) {
+		if (block.type !== "text") continue;
+		const text = unwrapQuoteBlocks(block.text);
+		if (text === block.text) continue;
+		block.text = text;
+		changed = true;
+	}
+	return changed;
+}
+
+function unwrapQuoteBlocks(text: string): string {
+	let out = "";
+	let index = 0;
+	while (index < text.length) {
+		const start = findNextQuoteBlockStart(text, index);
+		if (start === -1) {
+			out += text.slice(index);
+			break;
+		}
+
+		const block = readQuoteBlockAt(text, start);
+		if (!block) {
+			out += text.slice(index);
+			break;
+		}
+
+		out += text.slice(index, start);
+		out += unwrapQuoteBlocks(text.slice(block.bodyStart, block.closeStart));
+		index = block.end;
+	}
+	return out;
 }
 
 function pushSyntheticAssistantContentEvents(stream: AssistantMessageEventStream, message: AssistantMessage): void {
@@ -410,10 +452,18 @@ function parseToolBlocks(text: string, allowed?: Set<string>): ParsedToolBlock[]
 
 function findNextTextToolStart(text: string, from: number, allowed?: Set<string>): number {
 	const tools = allowed ? Array.from(allowed) : ALL_TOOLS;
-	for (let index = text.indexOf("<", from); index !== -1; index = text.indexOf("<", index + 1)) {
-		for (const name of tools) {
-			if (text.startsWith(`<${name}`, index) && isToolNameBoundary(text[index + name.length + 1])) return index;
+	let index = from;
+	while (index < text.length) {
+		const start = text.indexOf("<", index);
+		if (start === -1) return -1;
+		if (isQuoteBlockStart(text, start)) {
+			index = Math.max(start + 1, findQuoteBlockEnd(text, start));
+			continue;
 		}
+		for (const name of tools) {
+			if (text.startsWith(`<${name}`, start) && isToolNameBoundary(text[start + name.length + 1])) return start;
+		}
+		index = start + 1;
 	}
 	return -1;
 }
@@ -424,6 +474,79 @@ function knownTextToolNameAt(text: string, index: number, allowed?: Set<string>)
 		if (text.startsWith(`<${name}`, index) && isToolNameBoundary(text[index + name.length + 1])) return name;
 	}
 	return "";
+}
+
+function findNextLiteralOutsideQuote(text: string, literal: string, from: number): number {
+	let index = from;
+	while (index < text.length) {
+		const next = text.indexOf(literal, index);
+		if (next === -1) return -1;
+		const quoteStart = findNextQuoteBlockStart(text, index);
+		if (quoteStart !== -1 && quoteStart <= next) {
+			index = Math.max(quoteStart + 1, findQuoteBlockEnd(text, quoteStart));
+			continue;
+		}
+		return next;
+	}
+	return -1;
+}
+
+function findNextQuoteBlockStart(text: string, from: number): number {
+	for (
+		let index = text.indexOf(`<${QUOTE_TOOL_NAME}`, from);
+		index !== -1;
+		index = text.indexOf(`<${QUOTE_TOOL_NAME}`, index + 1)
+	) {
+		if (isQuoteBlockStart(text, index)) return index;
+	}
+	return -1;
+}
+
+function isQuoteBlockStart(text: string, index: number): boolean {
+	return text.startsWith(`<${QUOTE_TOOL_NAME}`, index) && isToolNameBoundary(text[index + QUOTE_TOOL_NAME.length + 1]);
+}
+
+function findQuoteBlockEnd(text: string, start: number): number {
+	return readQuoteBlockAt(text, start)?.end ?? text.length;
+}
+
+function readQuoteBlockAt(
+	text: string,
+	start: number,
+): { bodyStart: number; closeStart: number; end: number } | undefined {
+	const tagEnd = findTagEnd(text, start);
+	if (tagEnd === -1) return undefined;
+
+	let header = text.slice(start + 1, tagEnd).trim();
+	const selfClosing = header.endsWith("/");
+	if (selfClosing) return { bodyStart: tagEnd + 1, closeStart: tagEnd + 1, end: tagEnd + 1 };
+	if (selfClosing) header = header.slice(0, -1).trim();
+
+	const parsed = parseToolHeader(header);
+	if (parsed.name !== QUOTE_TOOL_NAME) return undefined;
+
+	let depth = 1;
+	let index = tagEnd + 1;
+	while (index < text.length) {
+		const nextOpen = findNextQuoteBlockStart(text, index);
+		const nextClose = text.indexOf(`</${QUOTE_TOOL_NAME}>`, index);
+		if (nextClose === -1) return undefined;
+
+		if (nextOpen !== -1 && nextOpen < nextClose) {
+			const openEnd = findTagEnd(text, nextOpen);
+			if (openEnd === -1) return undefined;
+			const openHeader = text.slice(nextOpen + 1, openEnd).trim();
+			if (!openHeader.endsWith("/")) depth++;
+			index = openEnd + 1;
+			continue;
+		}
+
+		depth--;
+		const end = nextClose + QUOTE_TOOL_NAME.length + 3;
+		if (depth === 0) return { bodyStart: tagEnd + 1, closeStart: nextClose, end };
+		index = end;
+	}
+	return undefined;
 }
 
 function isToolNameBoundary(ch: string | undefined): boolean {
@@ -945,9 +1068,9 @@ function parseToolCodeBlocks(text: string): ParsedToolBlock[] {
 	const close = "</tool_code>";
 	let index = 0;
 	while (index < text.length) {
-		const start = text.indexOf(open, index);
+		const start = findNextLiteralOutsideQuote(text, open, index);
 		if (start === -1) break;
-		const closeStart = text.indexOf(close, start + open.length);
+		const closeStart = findNextLiteralOutsideQuote(text, close, start + open.length);
 		if (closeStart === -1) break;
 		const end = closeStart + close.length;
 		out.push({
