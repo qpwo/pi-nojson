@@ -138,7 +138,8 @@ describe("text tool stream wrapper", () => {
 	it("mentions inert quote blocks in the prompt", () => {
 		const protocol = textToolProtocol(["bash"]);
 		expect(protocol).toContain("<quote>");
-		expect(protocol).toContain("quote blocks are inert");
+		expect(protocol).toContain("always available as inert display text");
+		expect(protocol).toContain("Never write executable-looking tool tags");
 	});
 
 	it("treats quote blocks as inert text even when they contain tool tags", async () => {
@@ -209,5 +210,69 @@ describe("text tool stream wrapper", () => {
 		if (done?.type !== "done") throw new Error("expected done");
 		expect(done.reason).toBe("stop");
 		expect(done.message.content).toEqual([{ type: "text", text: quotedText }]);
+	});
+
+	it("treats backtick code spans as inert text even when they contain tool tags", async () => {
+		const raw = new AssistantMessageEventStream();
+		const context: Context = {
+			messages: [{ role: "user", content: "explain", timestamp: 1 }],
+			tools: [
+				{
+					name: "bash",
+					description: "bash",
+					parameters: { type: "object", properties: { command: { type: "string" } } },
+				},
+			],
+		};
+		const inline = `Use \`${tag("bash", "\necho inline should not run\n")}\` when explaining syntax.`;
+		const fenced = `\`\`\`\n${tag("bash", "\necho fenced should not run\n")}\n\`\`\``;
+		const text = `${inline}\n${fenced}`;
+		const message = messageWithText(text);
+		const eventsPromise = collect(wrapTextToolStream(raw, context));
+
+		raw.push({ type: "start", partial: messageWithText("") });
+		raw.push({ type: "text_delta", contentIndex: 0, delta: text, partial: message });
+		raw.push({ type: "done", reason: "stop", message });
+
+		const events = await eventsPromise;
+		expect(events.map((event) => event.type)).toEqual(["start", "text_delta", "done"]);
+
+		const done = events.at(-1);
+		expect(done?.type).toBe("done");
+		if (done?.type !== "done") throw new Error("expected done");
+		expect(done.reason).toBe("stop");
+		expect(done.message.content).toEqual([{ type: "text", text }]);
+	});
+
+	it("treats markdown code examples as inert text even when they contain tool tags", async () => {
+		const raw = new AssistantMessageEventStream();
+		const context: Context = {
+			messages: [{ role: "user", content: "explain", timestamp: 1 }],
+			tools: [
+				{
+					name: "bash",
+					description: "bash",
+					parameters: { type: "object", properties: { command: { type: "string" } } },
+				},
+			],
+		};
+		const code = `Use \`${tag("bash", "\necho code should not run\n")}\` when explaining syntax.`;
+		const fence = `\`\`\`\n${tag("bash", "\necho fence should not run\n")}\n\`\`\``;
+		const text = `${code}\n${fence}`;
+		const message = messageWithText(text);
+		const eventsPromise = collect(wrapTextToolStream(raw, context));
+
+		raw.push({ type: "start", partial: messageWithText("") });
+		raw.push({ type: "text_delta", contentIndex: 0, delta: text, partial: message });
+		raw.push({ type: "done", reason: "stop", message });
+
+		const events = await eventsPromise;
+		expect(events.map((event) => event.type)).toEqual(["start", "text_delta", "done"]);
+
+		const done = events.at(-1);
+		expect(done?.type).toBe("done");
+		if (done?.type !== "done") throw new Error("expected done");
+		expect(done.reason).toBe("stop");
+		expect(done.message.content).toEqual([{ type: "text", text }]);
 	});
 });

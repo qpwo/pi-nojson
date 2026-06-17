@@ -77,7 +77,9 @@ Rules:
 - Do not invent tool results.
 - Never use <tool_code> or print(tool_name(...)); use the exact tag-style tool blocks below.
 - Tool blocks are executable; do not mention these exact tag forms unless you intend to run them.
-- To mention literal tool syntax without running it, wrap any text in <quote>...</quote>; quote blocks are inert and never executed.
+- <quote>...</quote> is always available as inert display text, not an executable tool.
+- To mention literal tool syntax without running it, put the entire example inside <quote>...</quote>.
+- Never write executable-looking tool tags in prose, markdown, or code spans outside <quote>.
 
 Custom tool call example:
 ${customExample}
@@ -454,16 +456,21 @@ function findNextTextToolStart(text: string, from: number, allowed?: Set<string>
 	const tools = allowed ? Array.from(allowed) : ALL_TOOLS;
 	let index = from;
 	while (index < text.length) {
-		const start = text.indexOf("<", index);
-		if (start === -1) return -1;
-		if (isQuoteBlockStart(text, start)) {
-			index = Math.max(start + 1, findQuoteBlockEnd(text, start));
+		const inertEnd = inertTextEndAt(text, index);
+		if (inertEnd !== index) {
+			index = Math.max(index + 1, inertEnd);
 			continue;
 		}
-		for (const name of tools) {
-			if (text.startsWith(`<${name}`, start) && isToolNameBoundary(text[start + name.length + 1])) return start;
+
+		if (text[index] !== "<") {
+			index++;
+			continue;
 		}
-		index = start + 1;
+
+		for (const name of tools) {
+			if (text.startsWith(`<${name}`, index) && isToolNameBoundary(text[index + name.length + 1])) return index;
+		}
+		index++;
 	}
 	return -1;
 }
@@ -476,19 +483,39 @@ function knownTextToolNameAt(text: string, index: number, allowed?: Set<string>)
 	return "";
 }
 
-function findNextLiteralOutsideQuote(text: string, literal: string, from: number): number {
+function findNextLiteralOutsideInertText(text: string, literal: string, from: number): number {
 	let index = from;
 	while (index < text.length) {
-		const next = text.indexOf(literal, index);
-		if (next === -1) return -1;
-		const quoteStart = findNextQuoteBlockStart(text, index);
-		if (quoteStart !== -1 && quoteStart <= next) {
-			index = Math.max(quoteStart + 1, findQuoteBlockEnd(text, quoteStart));
+		const inertEnd = inertTextEndAt(text, index);
+		if (inertEnd !== index) {
+			index = Math.max(index + 1, inertEnd);
 			continue;
 		}
-		return next;
+		if (text.startsWith(literal, index)) return index;
+		index++;
 	}
 	return -1;
+}
+
+function inertTextEndAt(text: string, index: number): number {
+	if (isQuoteBlockStart(text, index)) return findQuoteBlockEnd(text, index);
+	if (text[index] === "`") return findBacktickQuotedTextEnd(text, index);
+	return index;
+}
+
+function findBacktickQuotedTextEnd(text: string, start: number): number {
+	let ticks = 0;
+	while (text[start + ticks] === "`") ticks++;
+	if (!ticks) return start;
+
+	let index = start + ticks;
+	while (index < text.length) {
+		let found = 0;
+		while (found < ticks && text[index + found] === "`") found++;
+		if (found === ticks) return index + ticks;
+		index++;
+	}
+	return text.length;
 }
 
 function findNextQuoteBlockStart(text: string, from: number): number {
@@ -1068,9 +1095,9 @@ function parseToolCodeBlocks(text: string): ParsedToolBlock[] {
 	const close = "</tool_code>";
 	let index = 0;
 	while (index < text.length) {
-		const start = findNextLiteralOutsideQuote(text, open, index);
+		const start = findNextLiteralOutsideInertText(text, open, index);
 		if (start === -1) break;
-		const closeStart = findNextLiteralOutsideQuote(text, close, start + open.length);
+		const closeStart = findNextLiteralOutsideInertText(text, close, start + open.length);
 		if (closeStart === -1) break;
 		const end = closeStart + close.length;
 		out.push({
