@@ -491,6 +491,7 @@ function buildParams(
 	if (model.compat?.openRouterRouting) {
 		(params as any).provider = model.compat.openRouterRouting;
 	}
+	applyOpenRouterEnvRouting(params, model);
 
 	// Vercel AI Gateway provider routing preferences
 	if (model.baseUrl.includes("ai-gateway.vercel.sh") && model.compat?.vercelGatewayRouting) {
@@ -504,6 +505,56 @@ function buildParams(
 	}
 
 	return params;
+}
+
+/** Apply exact OpenRouter model/provider/quant routing requested by benchmark wrappers. */
+function applyOpenRouterEnvRouting(
+	params: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming,
+	model: Model<"openai-completions">,
+): void {
+	if (model.provider !== "openrouter" && !model.baseUrl.includes("openrouter.ai")) {
+		return;
+	}
+
+	const provider = routeEnv("PI_OPENROUTER_EXACT_PROVIDER");
+	const expectedModel = routeEnv("PI_OPENROUTER_EXACT_MODEL");
+	const quant = routeEnv("PI_OPENROUTER_EXACT_QUANT");
+	if (!provider && !expectedModel && !quant) {
+		return;
+	}
+
+	if (expectedModel && expectedModel !== model.id) {
+		throw new Error(
+			`PI_OPENROUTER_EXACT_MODEL mismatch: ${JSON.stringify({ expectedModel, actualModel: model.id })}`,
+		);
+	}
+	if (!provider) {
+		throw new Error("PI_OPENROUTER_EXACT_PROVIDER is required when exact OpenRouter routing env vars are set");
+	}
+
+	const routing: Record<string, unknown> = {
+		...(((params as any).provider ?? {}) as Record<string, unknown>),
+		allow_fallbacks: false,
+		require_parameters: true,
+		order: [provider],
+		only: [provider],
+	};
+	if (quant && quant !== "unknown") {
+		routing.quantizations = [quant];
+	}
+	(params as any).provider = routing;
+
+	if (routeEnv("PI_OPENROUTER_EXACT_LOG") !== "0") {
+		console.error(
+			"pi-nojson openrouter exact route " + JSON.stringify({ model: model.id, provider: routing, quant }),
+		);
+	}
+}
+
+/** Return a non-empty environment value trimmed. */
+function routeEnv(name: string): string | undefined {
+	const value = process.env[name]?.trim();
+	return value ? value : undefined;
 }
 
 function getCompatCacheControl(
