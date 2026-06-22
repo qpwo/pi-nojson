@@ -9,6 +9,7 @@ export {
 	type AgentSessionConfig,
 	type AgentSessionEvent,
 	type AgentSessionEventListener,
+	type AutoFollowUpOnStopConfig,
 	type ModelCycleResult,
 	type ParsedSkillBlock,
 	type PromptOptions,

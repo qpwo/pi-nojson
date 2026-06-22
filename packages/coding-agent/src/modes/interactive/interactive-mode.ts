@@ -797,7 +797,7 @@ export class InteractiveMode {
 		});
 
 		// Show startup warnings
-		const { migratedProviders, modelFallbackMessage, initialMessage, initialImages, initialMessages } = this.options;
+		const { migratedProviders, modelFallbackMessage } = this.options;
 
 		if (migratedProviders && migratedProviders.length > 0) {
 			this.showWarning(`Migrated credentials to auth.json: ${migratedProviders.join(", ")}`);
@@ -814,26 +814,7 @@ export class InteractiveMode {
 
 		void this.maybeWarnAboutAnthropicSubscriptionAuth();
 
-		// Process initial messages
-		if (initialMessage) {
-			try {
-				await this.session.prompt(initialMessage, { images: initialImages });
-			} catch (error: unknown) {
-				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
-				this.showError(errorMessage);
-			}
-		}
-
-		if (initialMessages) {
-			for (const message of initialMessages) {
-				try {
-					await this.session.prompt(message);
-				} catch (error: unknown) {
-					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
-					this.showError(errorMessage);
-				}
-			}
-		}
+		await this.processStartupPrompts();
 
 		// Main interactive loop
 		while (true) {
@@ -844,6 +825,42 @@ export class InteractiveMode {
 				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 				this.showError(errorMessage);
 			}
+		}
+	}
+
+	private async processStartupPrompts(): Promise<void> {
+		const { initialMessage, initialImages, initialMessages } = this.options;
+		let sentPrompt = false;
+
+		if (initialMessage) {
+			sentPrompt = true;
+			try {
+				await this.session.prompt(initialMessage, { images: initialImages });
+			} catch (error: unknown) {
+				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+				this.showError(errorMessage);
+			}
+		}
+
+		for (const message of initialMessages ?? []) {
+			sentPrompt = true;
+			try {
+				await this.session.prompt(message);
+			} catch (error: unknown) {
+				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+				this.showError(errorMessage);
+			}
+		}
+
+		if (sentPrompt || this.pendingUserInputs.length > 0) {
+			return;
+		}
+
+		try {
+			await this.session.runAutoFollowUpOnStop();
+		} catch (error: unknown) {
+			const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+			this.showError(errorMessage);
 		}
 	}
 
@@ -3984,6 +4001,8 @@ export class InteractiveMode {
 					enableSkillCommands: this.settingsManager.getEnableSkillCommands(),
 					steeringMode: this.session.steeringMode,
 					followUpMode: this.session.followUpMode,
+					autoFollowUpMaxWhatsSinceToolCall: this.settingsManager.getAutoFollowUpMaxWhatsSinceToolCall(),
+					autoFollowUpMaxWhatsSinceRealUserInput: this.settingsManager.getAutoFollowUpMaxWhatsSinceRealUserInput(),
 					transport: this.settingsManager.getTransport(),
 					httpIdleTimeoutMs: this.settingsManager.getHttpIdleTimeoutMs(),
 					thinkingLevel: this.session.thinkingLevel,
@@ -4040,6 +4059,22 @@ export class InteractiveMode {
 					},
 					onFollowUpModeChange: (mode) => {
 						this.session.setFollowUpMode(mode);
+					},
+					onAutoFollowUpMaxWhatsSinceToolCallChange: (maxWhats) => {
+						this.settingsManager.setAutoFollowUpMaxWhatsSinceToolCall(maxWhats);
+						this.session.setAutoFollowUpOnStop({
+							text: "what",
+							maxSinceToolCall: this.settingsManager.getAutoFollowUpMaxWhatsSinceToolCall(),
+							maxSinceRealUserInput: this.settingsManager.getAutoFollowUpMaxWhatsSinceRealUserInput(),
+						});
+					},
+					onAutoFollowUpMaxWhatsSinceRealUserInputChange: (maxWhats) => {
+						this.settingsManager.setAutoFollowUpMaxWhatsSinceRealUserInput(maxWhats);
+						this.session.setAutoFollowUpOnStop({
+							text: "what",
+							maxSinceToolCall: this.settingsManager.getAutoFollowUpMaxWhatsSinceToolCall(),
+							maxSinceRealUserInput: this.settingsManager.getAutoFollowUpMaxWhatsSinceRealUserInput(),
+						});
 					},
 					onTransportChange: (transport) => {
 						this.settingsManager.setTransport(transport);

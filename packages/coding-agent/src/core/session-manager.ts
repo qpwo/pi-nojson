@@ -10,6 +10,7 @@ import {
 	openSync,
 	readdirSync,
 	readSync,
+	realpathSync,
 	statSync,
 	writeFileSync,
 } from "fs";
@@ -530,8 +531,17 @@ function getSessionHeaderCwd(header: SessionHeader): string | undefined {
 	return typeof cwd === "string" ? cwd : undefined;
 }
 
+function canonicalSessionCwd(path: string): string {
+	const resolved = resolvePath(path);
+	try {
+		return realpathSync(resolved);
+	} catch {
+		return resolved;
+	}
+}
+
 function sessionCwdMatches(cwd: string | undefined, resolvedCwd: string): boolean {
-	return cwd !== undefined && cwd !== "" && resolvePath(cwd) === resolvedCwd;
+	return cwd !== undefined && cwd !== "" && canonicalSessionCwd(cwd) === canonicalSessionCwd(resolvedCwd);
 }
 
 /** Exported for testing */

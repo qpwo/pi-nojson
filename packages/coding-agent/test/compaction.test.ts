@@ -236,6 +236,30 @@ describe("shouldCompact", () => {
 		expect(shouldCompact(89000, 100000, settings)).toBe(false);
 	});
 
+	it("should cap the threshold for huge context windows", () => {
+		const settings: CompactionSettings = {
+			enabled: true,
+			reserveTokens: 10000,
+			keepRecentTokens: 20000,
+			triggerTokens: 180000,
+		};
+
+		expect(shouldCompact(180000, 1000000, settings)).toBe(false);
+		expect(shouldCompact(180001, 1000000, settings)).toBe(true);
+	});
+
+	it("should not allow configured threshold above the hard cap", () => {
+		const settings: CompactionSettings = {
+			enabled: true,
+			reserveTokens: 10000,
+			keepRecentTokens: 20000,
+			triggerTokens: 900000,
+		};
+
+		expect(shouldCompact(180000, 1000000, settings)).toBe(false);
+		expect(shouldCompact(180001, 1000000, settings)).toBe(true);
+	});
+
 	it("should return false when disabled", () => {
 		const settings: CompactionSettings = {
 			enabled: false,

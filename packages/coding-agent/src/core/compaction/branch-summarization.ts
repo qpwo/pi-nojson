@@ -317,7 +317,7 @@ export async function generateBranchSummary(
 	if (replaceInstructions && customInstructions) {
 		instructions = customInstructions;
 	} else if (customInstructions) {
-		instructions = `${BRANCH_SUMMARY_PROMPT}\n\nAdditional focus: ${customInstructions}`;
+		instructions = `${BRANCH_SUMMARY_PROMPT}\n\nAdditional instructions for this summary. These override the default summary instructions above when they conflict. Follow them exactly, including any requested exact final text:\n${customInstructions}`;
 	} else {
 		instructions = BRANCH_SUMMARY_PROMPT;
 	}

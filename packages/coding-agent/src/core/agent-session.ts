@@ -154,6 +154,23 @@ export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
 // Types
 // ============================================================================
 
+export interface AutoFollowUpOnStopConfig {
+	text: string;
+	maxSinceToolCall?: number;
+	maxSinceRealUserInput?: number;
+	/** @deprecated use maxSinceToolCall and maxSinceRealUserInput */
+	maxConsecutive?: number;
+}
+
+interface NormalizedAutoFollowUpOnStopConfig {
+	text: string;
+	maxSinceToolCall: number;
+	maxSinceRealUserInput: number;
+}
+
+const DEFAULT_AUTO_FOLLOW_UP_MAX_SINCE_TOOL_CALL = 3;
+const DEFAULT_AUTO_FOLLOW_UP_MAX_SINCE_REAL_USER_INPUT = 6;
+
 export interface AgentSessionConfig {
 	agent: Agent;
 	sessionManager: SessionManager;
@@ -184,6 +201,8 @@ export interface AgentSessionConfig {
 	extensionRunnerRef?: { current?: ExtensionRunner };
 	/** Session start event metadata emitted when extensions bind to this runtime. */
 	sessionStartEvent?: SessionStartEvent;
+	/** Optional automatic user follow-up injected whenever a run would otherwise stop. */
+	autoFollowUpOnStop?: AutoFollowUpOnStopConfig;
 }
 
 export interface ExtensionBindings {
@@ -271,6 +290,12 @@ export class AgentSession {
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	private _pendingNextTurnMessages: CustomMessage[] = [];
 
+	private _autoFollowUpOnStop: NormalizedAutoFollowUpOnStopConfig | undefined;
+	private _autoFollowUpsSinceToolCall = 0;
+	private _autoFollowUpsSinceRealUserInput = 0;
+	private _autoFollowUpMessages = new WeakSet<object>();
+	private _realUserInputMessages = new WeakSet<object>();
+
 	// Compaction state
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
@@ -337,6 +362,7 @@ export class AgentSession {
 		this._excludedToolNames = config.excludedToolNames ? new Set(config.excludedToolNames) : undefined;
 		this._baseToolsOverride = config.baseToolsOverride;
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
+		this._autoFollowUpOnStop = this._normalizeAutoFollowUpOnStop(config.autoFollowUpOnStop);
 
 		// Always subscribe to agent events for internal handling
 		// (session persistence, extensions, auto-compaction, retry logic)
@@ -469,6 +495,64 @@ export class AgentSession {
 		});
 	}
 
+	setAutoFollowUpOnStop(config: AutoFollowUpOnStopConfig | undefined): void {
+		this._autoFollowUpOnStop = this._normalizeAutoFollowUpOnStop(config);
+		this._resetAutoFollowUpCounters();
+	}
+
+	private _normalizeAutoFollowUpOnStop(
+		config: AutoFollowUpOnStopConfig | undefined,
+	): NormalizedAutoFollowUpOnStopConfig | undefined {
+		if (!config) {
+			return undefined;
+		}
+
+		const text = config.text.trim();
+		const legacyMax = config.maxConsecutive;
+		const maxSinceToolCall = this._normalizeAutoFollowUpLimit(
+			config.maxSinceToolCall ?? legacyMax,
+			DEFAULT_AUTO_FOLLOW_UP_MAX_SINCE_TOOL_CALL,
+		);
+		const maxSinceRealUserInput = this._normalizeAutoFollowUpLimit(
+			config.maxSinceRealUserInput ?? (legacyMax === undefined ? undefined : Number.MAX_SAFE_INTEGER),
+			DEFAULT_AUTO_FOLLOW_UP_MAX_SINCE_REAL_USER_INPUT,
+		);
+		if (text.length === 0 || maxSinceToolCall <= 0 || maxSinceRealUserInput <= 0) {
+			return undefined;
+		}
+
+		return { text, maxSinceToolCall, maxSinceRealUserInput };
+	}
+
+	private _normalizeAutoFollowUpLimit(value: number | undefined, defaultValue: number): number {
+		if (value === undefined) {
+			return defaultValue;
+		}
+		const normalized = Math.floor(value);
+		return Number.isFinite(normalized) ? normalized : 0;
+	}
+
+	private _isRealUserInputMessage(message: AgentMessage): boolean {
+		if (typeof message !== "object" || message === null) {
+			return false;
+		}
+
+		return this._realUserInputMessages.has(message);
+	}
+
+	private _resetAutoFollowUpCounters(): void {
+		this._autoFollowUpsSinceToolCall = 0;
+		this._autoFollowUpsSinceRealUserInput = 0;
+	}
+
+	private _resetAutoFollowUpsSinceToolCall(): void {
+		this._autoFollowUpsSinceToolCall = 0;
+	}
+
+	private _resetAutoFollowUpsSinceRealUserInput(): void {
+		this._autoFollowUpsSinceRealUserInput = 0;
+	}
+
 	// Track last assistant message for auto-compaction check
 	private _lastAssistantMessage: AssistantMessage | undefined = undefined;
 
@@ -478,6 +562,9 @@ export class AgentSession {
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
 			this._overflowRecoveryAttempted = false;
+			if (this._isRealUserInputMessage(event.message)) {
+				this._resetAutoFollowUpsSinceRealUserInput();
+			}
 			const messageText = this._getUserMessageText(event.message);
 			if (messageText) {
 				// Check steering queue first
@@ -494,6 +581,10 @@ export class AgentSession {
 					}
 				}
 			}
+		}
+
+		if (event.type === "tool_execution_start") {
+			this._resetAutoFollowUpsSinceToolCall();
 		}
 
 		// Emit to extensions first
@@ -948,7 +1039,10 @@ export class AgentSession {
 		const msg = this._lastAssistantMessage;
 		this._lastAssistantMessage = undefined;
 		if (!msg) {
-			return false;
+			if (this.agent.hasQueuedMessages()) {
+				return true;
+			}
+			return await this._queueAutoFollowUpOnStop();
 		}
 
 		if (this._isRetryableError(msg) && (await this._prepareRetry(msg))) {
@@ -971,7 +1065,53 @@ export class AgentSession {
 
 		// The agent loop drains both queues before emitting agent_end. Any messages
 		// here were queued by agent_end extension handlers and need a continuation.
-		return this.agent.hasQueuedMessages();
+		if (this.agent.hasQueuedMessages()) {
+			return true;
+		}
+
+		return await this._queueAutoFollowUpOnStop(msg);
+	}
+	async runAutoFollowUpOnStop(): Promise<boolean> {
+		const text = this._takeAutoFollowUpText();
+		if (!text) {
+			return false;
+		}
+
+		await this._runAgentPrompt(this._createUserTextMessage(text, undefined, { auto: true }));
+		return true;
+	}
+
+	private async _queueAutoFollowUpOnStop(message?: AssistantMessage): Promise<boolean> {
+		if (message?.stopReason === "aborted") {
+			return false;
+		}
+
+		const text = this._takeAutoFollowUpText();
+		if (!text) {
+			return false;
+		}
+
+		this._followUpMessages.push(text);
+		this._emitQueueUpdate();
+		this.agent.followUp(this._createUserTextMessage(text, undefined, { auto: true }));
+		return true;
+	}
+
+	private _takeAutoFollowUpText(): string | undefined {
+		if (!this._autoFollowUpOnStop) {
+			return undefined;
+		}
+
+		if (this._autoFollowUpsSinceToolCall >= this._autoFollowUpOnStop.maxSinceToolCall) {
+			return undefined;
+		}
+		if (this._autoFollowUpsSinceRealUserInput >= this._autoFollowUpOnStop.maxSinceRealUserInput) {
+			return undefined;
+		}
+
+		this._autoFollowUpsSinceToolCall++;
+		this._autoFollowUpsSinceRealUserInput++;
+		return this._autoFollowUpOnStop.text;
 	}
 
 	/**
@@ -1034,10 +1174,11 @@ export class AgentSession {
 						"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
 					);
 				}
+				const realUser = options.source !== "extension";
 				if (options.streamingBehavior === "followUp") {
-					await this._queueFollowUp(expandedText, currentImages);
+					await this._queueFollowUp(expandedText, currentImages, { realUser });
 				} else {
-					await this._queueSteer(expandedText, currentImages);
+					await this._queueSteer(expandedText, currentImages, { realUser });
 				}
 				preflightResult?.(true);
 				return;
@@ -1080,15 +1221,9 @@ export class AgentSession {
 			messages = [];
 
 			// Add user message
-			const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: expandedText }];
-			if (currentImages) {
-				userContent.push(...currentImages);
-			}
-			messages.push({
-				role: "user",
-				content: userContent,
-				timestamp: Date.now(),
-			});
+			messages.push(
+				this._createUserTextMessage(expandedText, currentImages, { realUser: options?.source !== "extension" }),
+			);
 
 			// Inject any pending "nextTurn" messages as context alongside the user message
 			for (const msg of this._pendingNextTurnMessages) {
@@ -1214,7 +1349,7 @@ export class AgentSession {
 		let expandedText = this._expandSkillCommand(text);
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 
-		await this._queueSteer(expandedText, images);
+		await this._queueSteer(expandedText, images, { realUser: true });
 	}
 
 	/**
@@ -1234,41 +1369,57 @@ export class AgentSession {
 		let expandedText = this._expandSkillCommand(text);
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 
-		await this._queueFollowUp(expandedText, images);
+		await this._queueFollowUp(expandedText, images, { realUser: true });
 	}
 
 	/**
 	 * Internal: Queue a steering message (already expanded, no extension command check).
 	 */
-	private async _queueSteer(text: string, images?: ImageContent[]): Promise<void> {
+	private async _queueSteer(
+		text: string,
+		images?: ImageContent[],
+		options: { realUser?: boolean } = {},
+	): Promise<void> {
 		this._steeringMessages.push(text);
 		this._emitQueueUpdate();
-		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
-		if (images) {
-			content.push(...images);
-		}
-		this.agent.steer({
-			role: "user",
-			content,
-			timestamp: Date.now(),
-		});
+		this.agent.steer(this._createUserTextMessage(text, images, options));
 	}
 
 	/**
 	 * Internal: Queue a follow-up message (already expanded, no extension command check).
 	 */
-	private async _queueFollowUp(text: string, images?: ImageContent[]): Promise<void> {
+	private async _queueFollowUp(
+		text: string,
+		images?: ImageContent[],
+		options: { auto?: boolean; realUser?: boolean } = {},
+	): Promise<void> {
 		this._followUpMessages.push(text);
 		this._emitQueueUpdate();
+		this.agent.followUp(this._createUserTextMessage(text, images, options));
+	}
+
+	private _createUserTextMessage(
+		text: string,
+		images?: ImageContent[],
+		options: { auto?: boolean; realUser?: boolean } = {},
+	): AgentMessage {
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
 			content.push(...images);
 		}
-		this.agent.followUp({
+
+		const message: AgentMessage = {
 			role: "user",
 			content,
 			timestamp: Date.now(),
-		});
+		};
+		if (options.auto) {
+			this._autoFollowUpMessages.add(message);
+		}
+		if (options.realUser) {
+			this._realUserInputMessages.add(message);
+		}
+		return message;
 	}
 
 	/**

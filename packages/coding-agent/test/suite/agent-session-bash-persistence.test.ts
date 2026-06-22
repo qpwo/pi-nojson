@@ -196,7 +196,11 @@ describe("AgentSession bash and persistence characterization", () => {
 	});
 
 	it("persists aborted assistant messages", async () => {
-		const harness = await createHarness();
+		const harness = await createHarness({
+			fauxProviderOptions: { tokensPerSecond: 200, tokenSize: { min: 1, max: 1 } },
+			initialActiveToolNames: [],
+			allowedToolNames: [],
+		});
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("x".repeat(20_000))]);
 
@@ -204,6 +208,7 @@ describe("AgentSession bash and persistence characterization", () => {
 			const unsubscribe = harness.session.subscribe((event) => {
 				if (event.type === "message_update") {
 					unsubscribe();
+					harness.session.agent.abort();
 					resolve();
 				}
 			});
@@ -211,7 +216,6 @@ describe("AgentSession bash and persistence characterization", () => {
 
 		const promptPromise = harness.session.prompt("hi");
 		await sawMessageUpdate;
-		await harness.session.abort();
 		await promptPromise;
 
 		const lastEntry = harness.sessionManager.getEntries()[harness.sessionManager.getEntries().length - 1];

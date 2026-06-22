@@ -395,4 +395,39 @@ describe("SettingsManager", () => {
 			expect(manager.getSessionDir()).toBe(join(homedir(), "sessions"));
 		});
 	});
+	describe("autoFollowUp", () => {
+		it("should default auto what limits to 3 since tool call and 6 since real user input", () => {
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			expect(manager.getAutoFollowUpMaxWhatsSinceToolCall()).toBe(3);
+			expect(manager.getAutoFollowUpMaxWhatsSinceRealUserInput()).toBe(6);
+		});
+
+		it("should load auto what limits from settings.json", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({ autoFollowUp: { maxWhatsSinceToolCall: 2, maxWhatsSinceRealUserInput: 5 } }),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			expect(manager.getAutoFollowUpMaxWhatsSinceToolCall()).toBe(2);
+			expect(manager.getAutoFollowUpMaxWhatsSinceRealUserInput()).toBe(5);
+		});
+
+		it("should persist auto what limits under autoFollowUp", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			manager.setAutoFollowUpMaxWhatsSinceToolCall(4);
+			manager.setAutoFollowUpMaxWhatsSinceRealUserInput(8);
+			await manager.flush();
+
+			const savedSettings = JSON.parse(readFileSync(settingsPath, "utf-8"));
+			expect(savedSettings.autoFollowUp).toEqual({
+				maxWhatsSinceToolCall: 4,
+				maxWhatsSinceRealUserInput: 8,
+			});
+		});
+	});
 });

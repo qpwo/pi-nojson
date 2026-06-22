@@ -11,6 +11,7 @@ export interface CompactionSettings {
 	enabled?: boolean; // default: true
 	reserveTokens?: number; // default: 16384
 	keepRecentTokens?: number; // default: 20000
+	triggerTokens?: number; // default: 180000, max current-context tokens before auto-compaction
 }
 
 export interface BranchSummarySettings {
@@ -77,6 +78,22 @@ export type PackageSource =
 			themes?: string[];
 	  };
 
+export interface AutoFollowUpSettings {
+	maxWhatsSinceToolCall?: number;
+	maxWhatsSinceRealUserInput?: number;
+}
+
+export const DEFAULT_AUTO_FOLLOW_UP_MAX_WHATS_SINCE_TOOL_CALL = 3;
+export const DEFAULT_AUTO_FOLLOW_UP_MAX_WHATS_SINCE_REAL_USER_INPUT = 6;
+
+function normalizeAutoFollowUpLimit(value: number | undefined, defaultValue: number): number {
+	if (value === undefined) {
+		return defaultValue;
+	}
+	const normalized = Math.floor(value);
+	return Number.isFinite(normalized) && normalized >= 0 ? normalized : defaultValue;
+}
+
 export interface Settings {
 	lastChangelogVersion?: string;
 	defaultProvider?: string;
@@ -85,6 +102,7 @@ export interface Settings {
 	transport?: TransportSetting; // default: "auto"
 	steeringMode?: "all" | "one-at-a-time";
 	followUpMode?: "all" | "one-at-a-time";
+	autoFollowUp?: AutoFollowUpSettings;
 	theme?: string;
 	compaction?: CompactionSettings;
 	branchSummary?: BranchSummarySettings;
@@ -713,6 +731,41 @@ export class SettingsManager {
 		this.save();
 	}
 
+	getAutoFollowUpMaxWhatsSinceToolCall(): number {
+		return normalizeAutoFollowUpLimit(
+			this.settings.autoFollowUp?.maxWhatsSinceToolCall,
+			DEFAULT_AUTO_FOLLOW_UP_MAX_WHATS_SINCE_TOOL_CALL,
+		);
+	}
+
+	setAutoFollowUpMaxWhatsSinceToolCall(value: number): void {
+		this.globalSettings.autoFollowUp = {
+			...this.globalSettings.autoFollowUp,
+			maxWhatsSinceToolCall: normalizeAutoFollowUpLimit(value, DEFAULT_AUTO_FOLLOW_UP_MAX_WHATS_SINCE_TOOL_CALL),
+		};
+		this.markModified("autoFollowUp");
+		this.save();
+	}
+
+	getAutoFollowUpMaxWhatsSinceRealUserInput(): number {
+		return normalizeAutoFollowUpLimit(
+			this.settings.autoFollowUp?.maxWhatsSinceRealUserInput,
+			DEFAULT_AUTO_FOLLOW_UP_MAX_WHATS_SINCE_REAL_USER_INPUT,
+		);
+	}
+
+	setAutoFollowUpMaxWhatsSinceRealUserInput(value: number): void {
+		this.globalSettings.autoFollowUp = {
+			...this.globalSettings.autoFollowUp,
+			maxWhatsSinceRealUserInput: normalizeAutoFollowUpLimit(
+				value,
+				DEFAULT_AUTO_FOLLOW_UP_MAX_WHATS_SINCE_REAL_USER_INPUT,
+			),
+		};
+		this.markModified("autoFollowUp");
+		this.save();
+	}
+
 	getTheme(): string | undefined {
 		return this.settings.theme;
 	}
@@ -764,11 +817,21 @@ export class SettingsManager {
 		return this.settings.compaction?.keepRecentTokens ?? 20000;
 	}
 
-	getCompactionSettings(): { enabled: boolean; reserveTokens: number; keepRecentTokens: number } {
+	getCompactionTriggerTokens(): number {
+		return this.settings.compaction?.triggerTokens ?? 180000;
+	}
+
+	getCompactionSettings(): {
+		enabled: boolean;
+		reserveTokens: number;
+		keepRecentTokens: number;
+		triggerTokens: number;
+	} {
 		return {
 			enabled: this.getCompactionEnabled(),
 			reserveTokens: this.getCompactionReserveTokens(),
 			keepRecentTokens: this.getCompactionKeepRecentTokens(),
+			triggerTokens: this.getCompactionTriggerTokens(),
 		};
 	}
 

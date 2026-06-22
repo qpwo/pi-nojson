@@ -116,12 +116,16 @@ export interface CompactionSettings {
 	enabled: boolean;
 	reserveTokens: number;
 	keepRecentTokens: number;
+	triggerTokens?: number;
 }
+
+export const DEFAULT_COMPACTION_TRIGGER_TOKENS = 180000;
 
 export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	enabled: true,
 	reserveTokens: 16384,
 	keepRecentTokens: 20000,
+	triggerTokens: DEFAULT_COMPACTION_TRIGGER_TOKENS,
 };
 
 // ============================================================================
@@ -218,7 +222,13 @@ export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEst
  */
 export function shouldCompact(contextTokens: number, contextWindow: number, settings: CompactionSettings): boolean {
 	if (!settings.enabled) return false;
-	return contextTokens > contextWindow - settings.reserveTokens;
+	const windowThreshold = contextWindow - settings.reserveTokens;
+	const configuredTrigger = Math.min(
+		settings.triggerTokens ?? DEFAULT_COMPACTION_TRIGGER_TOKENS,
+		DEFAULT_COMPACTION_TRIGGER_TOKENS,
+	);
+	const threshold = Math.min(windowThreshold, configuredTrigger);
+	return contextTokens > threshold;
 }
 
 // ============================================================================

@@ -23,9 +23,24 @@ type InputContext = {
 	pendingUserInputs: string[];
 };
 
+type StartupPromptContext = {
+	options: {
+		initialMessage?: string;
+		initialImages?: unknown[];
+		initialMessages?: string[];
+	};
+	session: {
+		prompt: ReturnType<typeof vi.fn<(text: string, options?: unknown) => Promise<void>>>;
+		runAutoFollowUpOnStop: ReturnType<typeof vi.fn<() => Promise<boolean>>>;
+	};
+	showError: ReturnType<typeof vi.fn<(message: string) => void>>;
+	pendingUserInputs: string[];
+};
+
 type InteractiveModePrivate = {
 	setupEditorSubmitHandler(this: SubmitContext): void;
 	getUserInput(this: InputContext): Promise<string>;
+	processStartupPrompts(this: StartupPromptContext): Promise<void>;
 };
 
 const interactiveModePrototype = InteractiveMode.prototype as unknown as InteractiveModePrivate;
@@ -44,6 +59,18 @@ function createSubmitContext(): SubmitContext {
 			prompt: vi.fn(async () => {}),
 		},
 		flushPendingBashComponents: vi.fn(),
+		pendingUserInputs: [],
+	};
+}
+
+function createStartupPromptContext(options: StartupPromptContext["options"] = {}): StartupPromptContext {
+	return {
+		options,
+		session: {
+			prompt: vi.fn(async () => {}),
+			runAutoFollowUpOnStop: vi.fn(async () => true),
+		},
+		showError: vi.fn(),
 		pendingUserInputs: [],
 	};
 }
@@ -68,5 +95,43 @@ describe("InteractiveMode startup input", () => {
 		await expect(interactiveModePrototype.getUserInput.call(context)).resolves.toBe("queued prompt");
 		expect(context.onInputCallback).toBeUndefined();
 		expect(context.pendingUserInputs).toEqual([]);
+	});
+
+	it("starts auto follow-up when no startup prompt exists", async () => {
+		const context = createStartupPromptContext();
+
+		await interactiveModePrototype.processStartupPrompts.call(context);
+
+		expect(context.session.prompt).not.toHaveBeenCalled();
+		expect(context.session.runAutoFollowUpOnStop).toHaveBeenCalledTimes(1);
+		expect(context.showError).not.toHaveBeenCalled();
+	});
+
+	it("does not start auto follow-up after configured startup prompts", async () => {
+		const context = createStartupPromptContext({
+			initialMessage: "hello",
+			initialImages: [{ type: "image", data: "abc" }],
+			initialMessages: ["again"],
+		});
+
+		await interactiveModePrototype.processStartupPrompts.call(context);
+
+		expect(context.session.prompt).toHaveBeenCalledTimes(2);
+		expect(context.session.prompt).toHaveBeenNthCalledWith(1, "hello", { images: [{ type: "image", data: "abc" }] });
+		expect(context.session.prompt).toHaveBeenNthCalledWith(2, "again");
+		expect(context.session.runAutoFollowUpOnStop).not.toHaveBeenCalled();
+		expect(context.showError).not.toHaveBeenCalled();
+	});
+
+	it("does not start auto follow-up before queued startup input", async () => {
+		const context = createStartupPromptContext();
+		context.pendingUserInputs.push("typed early");
+
+		await interactiveModePrototype.processStartupPrompts.call(context);
+
+		expect(context.session.prompt).not.toHaveBeenCalled();
+		expect(context.session.runAutoFollowUpOnStop).not.toHaveBeenCalled();
+		expect(context.pendingUserInputs).toEqual(["typed early"]);
+		expect(context.showError).not.toHaveBeenCalled();
 	});
 });

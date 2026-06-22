@@ -546,7 +546,7 @@ function applyOpenRouterEnvRouting(
 
 	if (routeEnv("PI_OPENROUTER_EXACT_LOG") !== "0") {
 		console.error(
-			"pi-nojson openrouter exact route " + JSON.stringify({ model: model.id, provider: routing, quant }),
+			`pi-nojson openrouter exact route ${JSON.stringify({ model: model.id, provider: routing, quant })}`,
 		);
 	}
 }

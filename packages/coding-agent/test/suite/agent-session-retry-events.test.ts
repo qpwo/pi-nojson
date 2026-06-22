@@ -332,7 +332,11 @@ describe("AgentSession retry and event characterization", () => {
 	});
 
 	it("emits agent_end for aborted runs and persists the aborted assistant message", async () => {
-		const harness = await createHarness();
+		const harness = await createHarness({
+			fauxProviderOptions: { tokensPerSecond: 200, tokenSize: { min: 1, max: 1 } },
+			initialActiveToolNames: [],
+			allowedToolNames: [],
+		});
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("x".repeat(20_000))]);
 
@@ -340,6 +344,7 @@ describe("AgentSession retry and event characterization", () => {
 			const unsubscribe = harness.session.subscribe((event) => {
 				if (event.type === "message_update") {
 					unsubscribe();
+					harness.session.agent.abort();
 					resolve();
 				}
 			});
@@ -347,7 +352,6 @@ describe("AgentSession retry and event characterization", () => {
 
 		const promptPromise = harness.session.prompt("hi");
 		await sawMessageUpdate;
-		await harness.session.abort();
 		await promptPromise;
 
 		expect(harness.events[harness.events.length - 1]?.type).toBe("agent_end");

@@ -117,13 +117,19 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		}
 
 		await rebindSession();
-
+		let sentPrompt = false;
 		if (initialMessage) {
+			sentPrompt = true;
 			await session.prompt(initialMessage, { images: initialImages });
 		}
 
 		for (const message of messages) {
+			sentPrompt = true;
 			await session.prompt(message);
+		}
+
+		if (!sentPrompt) {
+			await session.runAutoFollowUpOnStop();
 		}
 
 		if (mode === "text") {

@@ -442,4 +442,184 @@ describe("AgentSession queue characterization", () => {
 
 		expect(getUserTexts(harness)).toEqual(["hello", "conflict report"]);
 	});
+	it("auto follow-up sends what at stop up to the configured limit", async () => {
+		const harness = await createHarness({
+			autoFollowUpOnStop: { text: "what", maxConsecutive: 3 },
+		});
+		harnesses.push(harness);
+
+		harness.setResponses([
+			fauxAssistantMessage("idle 0"),
+			fauxAssistantMessage("idle 1"),
+			fauxAssistantMessage("idle 2"),
+			fauxAssistantMessage("idle 3"),
+		]);
+
+		await harness.session.prompt("start");
+
+		expect(getUserTexts(harness)).toEqual(["start", "what", "what", "what"]);
+		expect(getAssistantTexts(harness)).toEqual(["idle 0", "idle 1", "idle 2", "idle 3"]);
+	});
+	it("auto follow-up can start from an empty transcript", async () => {
+		const harness = await createHarness({
+			autoFollowUpOnStop: { text: "what", maxConsecutive: 3 },
+		});
+		harnesses.push(harness);
+
+		harness.setResponses([
+			fauxAssistantMessage("empty 0"),
+			fauxAssistantMessage("empty 1"),
+			fauxAssistantMessage("empty 2"),
+		]);
+
+		await harness.session.runAutoFollowUpOnStop();
+
+		expect(getUserTexts(harness)).toEqual(["what", "what", "what"]);
+		expect(getAssistantTexts(harness)).toEqual(["empty 0", "empty 1", "empty 2"]);
+	});
+
+	it("auto follow-up sends what after an unretryable assistant error", async () => {
+		const harness = await createHarness({
+			autoFollowUpOnStop: { text: "what", maxConsecutive: 1 },
+		});
+		harnesses.push(harness);
+
+		harness.setResponses([
+			{ ...fauxAssistantMessage("failed"), stopReason: "error", errorMessage: "fatal validation failed" },
+			fauxAssistantMessage("recovered"),
+		]);
+
+		await harness.session.prompt("start");
+
+		expect(getUserTexts(harness)).toEqual(["start", "what"]);
+		expect(getAssistantTexts(harness)).toEqual(["failed", "recovered"]);
+	});
+
+	it("auto follow-up waits for explicit agent_end follow-ups", async () => {
+		let sent = false;
+		const harness = await createHarness({
+			autoFollowUpOnStop: { text: "what", maxConsecutive: 1 },
+			extensionFactories: [
+				(pi: ExtensionAPI) => {
+					pi.on("agent_end", async () => {
+						if (sent) {
+							return;
+						}
+						sent = true;
+						pi.sendUserMessage("conflict report", { deliverAs: "followUp" });
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+
+		harness.setResponses([
+			fauxAssistantMessage("reply"),
+			fauxAssistantMessage("follow-up reply"),
+			fauxAssistantMessage("auto reply"),
+		]);
+
+		await harness.session.prompt("hello");
+		await harness.session.agent.waitForIdle();
+
+		expect(getUserTexts(harness)).toEqual(["hello", "conflict report", "what"]);
+		expect(getAssistantTexts(harness)).toEqual(["reply", "follow-up reply", "auto reply"]);
+	});
+
+	it("auto follow-up stops after the since-tool-call budget is exhausted", async () => {
+		const harness = await createHarness({
+			autoFollowUpOnStop: { text: "what", maxSinceToolCall: 3, maxSinceRealUserInput: 6 },
+		});
+		harnesses.push(harness);
+
+		harness.setResponses([
+			fauxAssistantMessage("idle 0"),
+			fauxAssistantMessage("idle 1"),
+			fauxAssistantMessage("idle 2"),
+			fauxAssistantMessage("idle 3"),
+			fauxAssistantMessage("should not run"),
+		]);
+
+		await harness.session.prompt("start");
+
+		expect(getUserTexts(harness)).toEqual(["start", "what", "what", "what"]);
+		expect(getAssistantTexts(harness)).toEqual(["idle 0", "idle 1", "idle 2", "idle 3"]);
+		expect(harness.getPendingResponseCount()).toBe(1);
+	});
+
+	it("auto follow-up tool calls reset only the since-tool-call budget", async () => {
+		const toolCalls: string[] = [];
+		const pingTool: AgentTool = {
+			name: "ping",
+			label: "Ping",
+			description: "Record a ping",
+			parameters: Type.Object({}),
+			execute: async () => {
+				toolCalls.push("ping");
+				return {
+					content: [{ type: "text", text: "pong" }],
+					details: {},
+				};
+			},
+		};
+		const harness = await createHarness({
+			tools: [pingTool],
+			autoFollowUpOnStop: { text: "what", maxSinceToolCall: 3, maxSinceRealUserInput: 6 },
+		});
+		harnesses.push(harness);
+
+		harness.setResponses([
+			fauxAssistantMessage("idle 0"),
+			fauxAssistantMessage("idle 1"),
+			fauxAssistantMessage(fauxToolCall("ping", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("after tool"),
+			fauxAssistantMessage("after reset 1"),
+			fauxAssistantMessage("after reset 2"),
+			fauxAssistantMessage(fauxToolCall("ping", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("after second tool"),
+			fauxAssistantMessage("after sixth what"),
+			fauxAssistantMessage("should not run"),
+		]);
+
+		await harness.session.prompt("start");
+
+		expect(toolCalls).toEqual(["ping", "ping"]);
+		expect(getUserTexts(harness)).toEqual(["start", "what", "what", "what", "what", "what", "what"]);
+		expect(getAssistantTexts(harness)).toEqual([
+			"idle 0",
+			"idle 1",
+			"",
+			"after tool",
+			"after reset 1",
+			"after reset 2",
+			"",
+			"after second tool",
+			"after sixth what",
+		]);
+		expect(harness.getPendingResponseCount()).toBe(1);
+	});
+	it("auto follow-up real-user-input budget resets on real user input", async () => {
+		const harness = await createHarness({
+			autoFollowUpOnStop: { text: "what", maxSinceToolCall: 10, maxSinceRealUserInput: 1 },
+		});
+		harnesses.push(harness);
+
+		harness.setResponses([
+			fauxAssistantMessage("first reply"),
+			fauxAssistantMessage("first what reply"),
+			fauxAssistantMessage("second reply"),
+			fauxAssistantMessage("second what reply"),
+		]);
+
+		await harness.session.prompt("start");
+		await harness.session.prompt("next");
+
+		expect(getUserTexts(harness)).toEqual(["start", "what", "next", "what"]);
+		expect(getAssistantTexts(harness)).toEqual([
+			"first reply",
+			"first what reply",
+			"second reply",
+			"second what reply",
+		]);
+	});
 });

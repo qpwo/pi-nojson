@@ -50,6 +50,8 @@ export interface SettingsConfig {
 	enableSkillCommands: boolean;
 	steeringMode: "all" | "one-at-a-time";
 	followUpMode: "all" | "one-at-a-time";
+	autoFollowUpMaxWhatsSinceToolCall: number;
+	autoFollowUpMaxWhatsSinceRealUserInput: number;
 	transport: Transport;
 	httpIdleTimeoutMs: number;
 	thinkingLevel: ThinkingLevel;
@@ -80,6 +82,8 @@ export interface SettingsCallbacks {
 	onEnableSkillCommandsChange: (enabled: boolean) => void;
 	onSteeringModeChange: (mode: "all" | "one-at-a-time") => void;
 	onFollowUpModeChange: (mode: "all" | "one-at-a-time") => void;
+	onAutoFollowUpMaxWhatsSinceToolCallChange: (maxWhats: number) => void;
+	onAutoFollowUpMaxWhatsSinceRealUserInputChange: (maxWhats: number) => void;
 	onTransportChange: (transport: Transport) => void;
 	onHttpIdleTimeoutMsChange: (timeoutMs: number) => void;
 	onThinkingLevelChange: (level: ThinkingLevel) => void;
@@ -245,6 +249,20 @@ export class SettingsSelectorComponent extends Container {
 				description: `${followUpKey} queues follow-up messages until agent stops. 'one-at-a-time': deliver one, wait for response. 'all': deliver all at once.`,
 				currentValue: config.followUpMode,
 				values: ["one-at-a-time", "all"],
+			},
+			{
+				id: "auto-follow-up-tool-call-limit",
+				label: "Auto-what/tool limit",
+				description: "Maximum automatic 'what' prompts between AI tool calls",
+				currentValue: String(config.autoFollowUpMaxWhatsSinceToolCall),
+				values: ["1", "2", "3", "4", "5", "6", "8", "10"],
+			},
+			{
+				id: "auto-follow-up-user-input-limit",
+				label: "Auto-what/user limit",
+				description: "Maximum automatic 'what' prompts since the last real user input",
+				currentValue: String(config.autoFollowUpMaxWhatsSinceRealUserInput),
+				values: ["1", "2", "3", "4", "5", "6", "8", "10"],
 			},
 			{
 				id: "transport",
@@ -508,6 +526,12 @@ export class SettingsSelectorComponent extends Container {
 						break;
 					case "follow-up-mode":
 						callbacks.onFollowUpModeChange(newValue as "all" | "one-at-a-time");
+						break;
+					case "auto-follow-up-tool-call-limit":
+						callbacks.onAutoFollowUpMaxWhatsSinceToolCallChange(parseInt(newValue, 10));
+						break;
+					case "auto-follow-up-user-input-limit":
+						callbacks.onAutoFollowUpMaxWhatsSinceRealUserInputChange(parseInt(newValue, 10));
 						break;
 					case "transport":
 						callbacks.onTransportChange(newValue as Transport);

@@ -158,6 +158,17 @@ async function findLocalSessionByExactId(
 	return localMatch ? { type: "local", path: localMatch.path } : undefined;
 }
 
+async function forkTargetSessionIdExists(sessionId: string, cwd: string, sessionDir?: string): Promise<boolean> {
+	const localMatch = await findLocalSessionByExactId(sessionId, cwd, sessionDir);
+	if (localMatch) {
+		return true;
+	}
+	if (!sessionDir) {
+		return false;
+	}
+	return (await SessionManager.listAll(sessionDir)).some((session) => session.id === sessionId);
+}
+
 async function resolveSessionPath(sessionArg: string, cwd: string, sessionDir?: string): Promise<ResolvedSession> {
 	// If it looks like a file path, resolve it before handing it to the session manager.
 	if (sessionArg.includes("/") || sessionArg.includes("\\") || sessionArg.endsWith(".jsonl")) {
@@ -261,12 +272,9 @@ async function createSessionManager(
 	}
 
 	if (parsed.fork) {
-		if (parsed.sessionId) {
-			const existingTarget = await findLocalSessionByExactId(parsed.sessionId, cwd, sessionDir);
-			if (existingTarget) {
-				console.error(chalk.red(`Session already exists with id '${parsed.sessionId}'`));
-				process.exit(1);
-			}
+		if (parsed.sessionId && (await forkTargetSessionIdExists(parsed.sessionId, cwd, sessionDir))) {
+			console.error(chalk.red(`Session already exists with id '${parsed.sessionId}'`));
+			process.exit(1);
 		}
 
 		const resolved = await resolveSessionPath(parsed.fork, cwd, sessionDir);
@@ -697,6 +705,14 @@ export async function main(args: string[], options?: MainOptions) {
 			excludeTools: sessionOptions.excludeTools,
 			noTools: sessionOptions.noTools,
 			customTools: sessionOptions.customTools,
+			autoFollowUpOnStop:
+				appMode === "rpc"
+					? undefined
+					: {
+							text: "what",
+							maxSinceToolCall: settingsManager.getAutoFollowUpMaxWhatsSinceToolCall(),
+							maxSinceRealUserInput: settingsManager.getAutoFollowUpMaxWhatsSinceRealUserInput(),
+						},
 		});
 		const cliThinkingOverride = parsed.thinking !== undefined || cliThinkingFromModel;
 		if (created.session.model && cliThinkingOverride) {
