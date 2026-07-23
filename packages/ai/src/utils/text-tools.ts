@@ -177,9 +177,12 @@ export function attachTextToolCalls(context: { tools?: Tool[] }, assistant: Assi
 }
 
 export function toolCallsFromAssistantText(text: string, allowed?: Set<string>): ToolCall[] {
-	const calls = toolCallsFromTextBlocks(parseToolBlocks(text, allowed), allowed);
-	if (calls.length) return calls;
-	return toolCallsFromToolCode(text, allowed);
+    text = stripKnownStopSequences(text);
+    const blocks = parseToolBlocks(text, allowed);
+    if (blocks.length) return toolCallsFromTextBlocks(blocks, allowed);
+    const codeBlocks = parseToolCodeBlocks(text);
+    if (codeBlocks.length) return toolCallsFromToolCodeBlocks(codeBlocks, allowed);
+    return [];
 }
 
 export function assistantTextForProvider(content: (TextContent | ImageContent | ToolCall)[] | undefined): string {
@@ -469,6 +472,12 @@ function parseToolBlocks(text: string, allowed?: Set<string>): ParsedToolBlock[]
 		index = end;
 	}
 	return out;
+}
+
+function hasLiteralToolIntro(text: string, blocks: ParsedToolBlock[]): boolean {
+	const prefix = text.slice(0, blocks[0]?.start ?? 0).trimEnd();
+	if (!prefix) return false;
+	return prefix[prefix.length - 1] === ":";
 }
 
 function findNextTextToolStart(text: string, from: number, allowed?: Set<string>): number {
@@ -1083,6 +1092,7 @@ function stripKnownStopSequences(text: unknown): string {
 }
 
 function maybeStripToolBlocks(text: string, allowed?: Set<string>): string {
+	text = stripKnownStopSequences(text);
 	let blocks = parseToolBlocks(text, allowed);
 	if (!blocks.length) blocks = parseToolCodeBlocks(text);
 	if (!blocks.length) return text;
@@ -1096,9 +1106,9 @@ function maybeStripToolBlocks(text: string, allowed?: Set<string>): string {
 	return out + text.slice(index);
 }
 
-function toolCallsFromToolCode(text: string, allowed?: Set<string>): ToolCall[] {
+function toolCallsFromToolCodeBlocks(blocks: ParsedToolBlock[], allowed?: Set<string>): ToolCall[] {
 	const calls: ToolCall[] = [];
-	for (const block of parseToolCodeBlocks(text)) {
+	for (const block of blocks) {
 		try {
 			calls.push(parseToolCodeCall(block.body, allowed, block.raw));
 		} catch (error) {
@@ -1420,10 +1430,10 @@ function escapeToolAttr(value: unknown): string {
 
 function safeToolResultText(text: string): string {
 	return String(text || "")
-		.split("</tool_result>")
-		.join("</ tool_result>")
-		.split("</tool_results>")
-		.join("</ tool_results>");
+		.split("<")
+		.join(`${String.fromCharCode(38)}lt;`)
+		.split(">")
+		.join(`${String.fromCharCode(38)}gt;`);
 }
 
 function dropUndefined(obj: Record<string, unknown>): Record<string, unknown> {

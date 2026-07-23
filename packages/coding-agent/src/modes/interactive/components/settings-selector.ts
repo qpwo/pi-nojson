@@ -255,14 +255,14 @@ export class SettingsSelectorComponent extends Container {
 				label: "Auto-what/tool limit",
 				description: "Maximum automatic 'what' prompts between AI tool calls",
 				currentValue: String(config.autoFollowUpMaxWhatsSinceToolCall),
-				values: ["1", "2", "3", "4", "5", "6", "8", "10"],
+				values: ["0","1", "2", "3", "4", "5", "6", "8", "10"],
 			},
 			{
 				id: "auto-follow-up-user-input-limit",
 				label: "Auto-what/user limit",
 				description: "Maximum automatic 'what' prompts since the last real user input",
 				currentValue: String(config.autoFollowUpMaxWhatsSinceRealUserInput),
-				values: ["1", "2", "3", "4", "5", "6", "8", "10"],
+				values: ["0","1", "2", "3", "4", "5", "6", "8", "10"],
 			},
 			{
 				id: "transport",
